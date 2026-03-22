@@ -129,11 +129,11 @@ void TensorProductVolumeOCCA(occa::device &device, int M, int MPad, int N,
 #if TIMER
   }
   auto duration=stopwatch.tock()/ NTRYS;
-  double FLOP = (2*N-1)*(K*K*M + K*M*M + M*M*M);
+  double FLOP = (double)N * 2.0 * K * (K*K*M + K*M*M + M*M*M);
   double FLOPS = FLOP/duration/1e12;
   double BYTES = N*(8*K*K*K + 3*K*M*8 + 8*M*M*M);
   printf("Arithmetic intensity (FLOP/BYTES) = %f\n", FLOP/BYTES);
-  printf("OCCA unified kernel Compute time = %e TFLOPS=%.2f\n", stopwatch.tock() / NTRYS, FLOPS);
+  printf("OCCA unified kernel Compute time = %e TFLOPS=%.2f\n", duration, FLOPS);
 #endif
   // copy back
   d_C.copyTo(C.data());
