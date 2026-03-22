@@ -186,7 +186,8 @@ def main():
         return
 
     dev = torch.cuda.get_device_properties(0)
-    print(f"\nGPU: {dev.name}  (SM {dev.major}.{dev.minor}, {dev.total_mem // 2**20} MB)")
+    mem = getattr(dev, 'total_mem', None) or getattr(dev, 'total_memory', 0)
+    print(f"\nGPU: {dev.name}  (SM {dev.major}.{dev.minor}, {mem // 2**20} MB)")
 
     Ar_t = torch.from_numpy(Ar).cuda()
     As_t = torch.from_numpy(As).cuda()
