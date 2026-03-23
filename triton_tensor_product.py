@@ -152,6 +152,64 @@ def triton_tensor_product(Ar, As, At, B, M, K, N):
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Triton fused kernel — all 3 stages in one launch, no intermediates
+# ─────────────────────────────────────────────────────────────────────
+# Vectorizes over the (b,c) output plane (M*M lanes).  Loops over the
+# output 'a' dimension and all contraction indices (i,j,k) via
+# tl.static_range.  Stage 1 is recomputed M times (once per 'a') —
+# this trades ~12x more FLOPs for ~2x less global memory traffic,
+# moving the kernel from bandwidth-bound into compute-bound territory.
+
+if HAS_TRITON:
+
+    @triton.jit
+    def _fused_tp_kernel(
+        Ar_ptr, As_ptr, At_ptr, B_ptr, C_ptr,
+        N: tl.constexpr, M: tl.constexpr, K: tl.constexpr,
+        BLOCK_BC: tl.constexpr,
+    ):
+        n = tl.program_id(0)
+        bc = tl.arange(0, BLOCK_BC)
+        bc_mask = bc < M * M
+        c = bc % M
+        b = bc // M
+
+        for a in tl.static_range(M):
+            C_acc = tl.zeros([BLOCK_BC], dtype=tl.float64)
+
+            for i in tl.static_range(K):
+                # Ar[a, i] — scalar, same for all lanes
+                ar_val = tl.load(Ar_ptr + a * K + i)
+
+                tmp2 = tl.zeros([BLOCK_BC], dtype=tl.float64)
+                for j in tl.static_range(K):
+                    # As[b, j] — vectorized over b
+                    as_val = tl.load(As_ptr + b * K + j, mask=bc_mask)
+
+                    tmp1 = tl.zeros([BLOCK_BC], dtype=tl.float64)
+                    for k in tl.static_range(K):
+                        # At[c, k] — vectorized over c
+                        at_val = tl.load(At_ptr + c * K + k, mask=bc_mask)
+                        # B[n,i,j,k] — scalar, broadcast
+                        b_val = tl.load(B_ptr + n * K*K*K + i * K*K + j * K + k)
+                        tmp1 += at_val * b_val
+
+                    tmp2 += as_val * tmp1
+
+                C_acc += ar_val * tmp2
+
+            tl.store(C_ptr + n * M*M*M + a * M*M + bc, C_acc, mask=bc_mask)
+
+
+def triton_tensor_product_fused(Ar, As, At, B, M, K, N):
+    """Fused single-kernel tensor product.  All tensors must be on CUDA."""
+    BLOCK_BC = next_power_of_2(M * M)
+    C = torch.empty((N, M, M, M), dtype=torch.float64, device='cuda')
+    _fused_tp_kernel[(N,)](Ar, As, At, B, C, N, M, K, BLOCK_BC)
+    return C
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────
 
@@ -243,6 +301,31 @@ def main():
     except Exception as e:
         print(f"  Triton compilation failed (likely SM < 7.0): {e}")
         print("  Falling back to torch.einsum results above.")
+        return
+
+    # ── Triton fused kernel ──────────────────────────────────────────
+    print("\n--- Triton fused kernel ---")
+    try:
+        C_fused = triton_tensor_product_fused(Ar_t, As_t, At_t, B_t, M, K, N)
+        torch.cuda.synchronize()
+
+        diff_fused = np.max(np.abs(C_cpu - C_fused.cpu().numpy()))
+        status = "PASS" if diff_fused <= tol else "FAIL"
+        print(f"  CPU vs Triton fused  max|diff| = {diff_fused:.3e}  [{status}]")
+
+        # warm-up + timing
+        for _ in range(3):
+            triton_tensor_product_fused(Ar_t, As_t, At_t, B_t, M, K, N)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(ntrys):
+            triton_tensor_product_fused(Ar_t, As_t, At_t, B_t, M, K, N)
+        torch.cuda.synchronize()
+        dt_fused = (time.perf_counter() - t0) / ntrys
+        print(f"  time = {dt_fused:.4e} s   TFLOPS = {FLOP / dt_fused / 1e12:.3f}")
+
+    except Exception as e:
+        print(f"  Triton fused compilation failed: {e}")
 
 
 if __name__ == '__main__':
