@@ -152,13 +152,13 @@ def triton_tensor_product(Ar, As, At, B, M, K, N):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Triton fused kernel — all 3 stages in one launch, no intermediates
+# Triton fused kernel — single launch, no intermediate buffers
 # ─────────────────────────────────────────────────────────────────────
-# Vectorizes over the (b,c) output plane (M*M lanes).  Loops over the
-# output 'a' dimension and all contraction indices (i,j,k) via
-# tl.static_range.  Stage 1 is recomputed M times (once per 'a') —
-# this trades ~12x more FLOPs for ~2x less global memory traffic,
-# moving the kernel from bandwidth-bound into compute-bound territory.
+# Vectorizes over all M*M*M output elements (a,b,c) — 512 lanes for
+# M=8, giving 16 warps per program.  Loops over contraction indices
+# (i,j,k) via tl.static_range with the innermost k loop partially
+# sum-factorized.  Operator matrices (Ar,As,At) are tiny and stay in
+# L1; B values are scalar broadcasts.  No global memory intermediates.
 
 if HAS_TRITON:
 
@@ -166,46 +166,40 @@ if HAS_TRITON:
     def _fused_tp_kernel(
         Ar_ptr, As_ptr, At_ptr, B_ptr, C_ptr,
         N: tl.constexpr, M: tl.constexpr, K: tl.constexpr,
-        BLOCK_BC: tl.constexpr,
+        BLOCK: tl.constexpr,
     ):
         n = tl.program_id(0)
-        bc = tl.arange(0, BLOCK_BC)
-        bc_mask = bc < M * M
-        c = bc % M
-        b = bc // M
+        offs = tl.arange(0, BLOCK)
+        mask = offs < M * M * M
+        c = offs % M
+        b = (offs // M) % M
+        a = offs // (M * M)
 
-        for a in tl.static_range(M):
-            C_acc = tl.zeros([BLOCK_BC], dtype=tl.float64)
+        acc = tl.zeros([BLOCK], dtype=tl.float64)
 
-            for i in tl.static_range(K):
-                # Ar[a, i] — scalar, same for all lanes
-                ar_val = tl.load(Ar_ptr + a * K + i)
+        for i in tl.static_range(K):
+            ar_val = tl.load(Ar_ptr + a * K + i, mask=mask)
+            for j in tl.static_range(K):
+                as_val = tl.load(As_ptr + b * K + j, mask=mask)
+                ar_as = ar_val * as_val
 
-                tmp2 = tl.zeros([BLOCK_BC], dtype=tl.float64)
-                for j in tl.static_range(K):
-                    # As[b, j] — vectorized over b
-                    as_val = tl.load(As_ptr + b * K + j, mask=bc_mask)
+                # partial sum-factorization: accumulate k contraction first
+                tmp = tl.zeros([BLOCK], dtype=tl.float64)
+                for k in tl.static_range(K):
+                    at_val = tl.load(At_ptr + c * K + k, mask=mask)
+                    b_val = tl.load(B_ptr + n * K*K*K + i * K*K + j * K + k)
+                    tmp += at_val * b_val
 
-                    tmp1 = tl.zeros([BLOCK_BC], dtype=tl.float64)
-                    for k in tl.static_range(K):
-                        # At[c, k] — vectorized over c
-                        at_val = tl.load(At_ptr + c * K + k, mask=bc_mask)
-                        # B[n,i,j,k] — scalar, broadcast
-                        b_val = tl.load(B_ptr + n * K*K*K + i * K*K + j * K + k)
-                        tmp1 += at_val * b_val
+                acc += ar_as * tmp
 
-                    tmp2 += as_val * tmp1
-
-                C_acc += ar_val * tmp2
-
-            tl.store(C_ptr + n * M*M*M + a * M*M + bc, C_acc, mask=bc_mask)
+        tl.store(C_ptr + n * M*M*M + offs, acc, mask=mask)
 
 
 def triton_tensor_product_fused(Ar, As, At, B, M, K, N):
     """Fused single-kernel tensor product.  All tensors must be on CUDA."""
-    BLOCK_BC = next_power_of_2(M * M)
+    BLOCK = next_power_of_2(M * M * M)
     C = torch.empty((N, M, M, M), dtype=torch.float64, device='cuda')
-    _fused_tp_kernel[(N,)](Ar, As, At, B, C, N, M, K, BLOCK_BC)
+    _fused_tp_kernel[(N,)](Ar, As, At, B, C, N, M, K, BLOCK)
     return C
 
 
