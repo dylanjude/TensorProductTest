@@ -28,10 +28,10 @@ except ImportError:
     HAS_TRITON = False
 
 try:
-    from numba import cuda, float64
-    HAS_NUMBA = True
+    from torch.utils.cpp_extension import load_inline
+    HAS_CUDA_EXT = True
 except ImportError:
-    HAS_NUMBA = False
+    HAS_CUDA_EXT = False
 
 # ─────────────────────────────────────────────────────────────────────
 # Helpers
@@ -228,135 +228,177 @@ class TritonGraphed:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Numba CUDA kernel — shared memory, syncthreads (mirrors OCCA)
+# CUDA C++ fused kernel — shared memory + __syncthreads__ (mirrors OCCA)
 # ─────────────────────────────────────────────────────────────────────
+# Compiled via torch.utils.cpp_extension.load_inline (nvcc → cubin).
 # One block per batch element, K*K*M threads per block.
 # Operators and B loaded into shared memory.  Intermediates (tmpK, tmpJ)
-# live entirely in shared memory with syncthreads between stages.
-# Each thread handles multiple outputs in stages 2 and 3.
+# live entirely in shared memory with __syncthreads() between stages.
 
-def make_numba_tp_kernel(M, K):
-    """Build a Numba CUDA kernel specialised for given M, K."""
-    TPB = K * K * M          # threads per block (128 for M=8, K=4)
-    S1  = K * K * M          # stage 1 outputs per slice
-    S2  = K * M * M          # stage 2 outputs per slice
-    S3  = M * M * M          # stage 3 outputs per slice
-    MK  = M * K              # operator size
-    K3  = K * K * K           # B slice size
-    nper_s2 = (S2 + TPB - 1) // TPB   # outputs per thread, stage 2
-    nper_s3 = (S3 + TPB - 1) // TPB   # outputs per thread, stage 3
+_CUDA_KERNEL_SRC = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
 
-    @cuda.jit
-    def _kernel(Ar, As, At, B, C, N):
-        n = cuda.blockIdx.x
-        if n >= N:
-            return
-        tid = cuda.threadIdx.x
+// Template parameters for compile-time M, K
+template <int M, int K>
+__global__ void fused_tp_kernel(
+    const double* __restrict__ Ar,
+    const double* __restrict__ As,
+    const double* __restrict__ At,
+    const double* __restrict__ B,
+    double* __restrict__ C,
+    int N)
+{
+    const int n = blockIdx.x;
+    if (n >= N) return;
+    const int tid = threadIdx.x;
 
-        # ── shared memory ────────────────────────────────────────────
-        sAt = cuda.shared.array(shape=(MK,), dtype=float64)
-        sAs = cuda.shared.array(shape=(MK,), dtype=float64)
-        sAr = cuda.shared.array(shape=(MK,), dtype=float64)
-        sB  = cuda.shared.array(shape=(K3,), dtype=float64)
-        tmpK = cuda.shared.array(shape=(S1,), dtype=float64)
-        tmpJ = cuda.shared.array(shape=(S2,), dtype=float64)
+    constexpr int MK  = M * K;
+    constexpr int K3  = K * K * K;
+    constexpr int S1  = K * K * M;    // stage 1 outputs
+    constexpr int S2  = K * M * M;    // stage 2 outputs
+    constexpr int S3  = M * M * M;    // stage 3 outputs
+    constexpr int TPB = K * K * M;    // threads per block = S1
+    constexpr int NPER_S2 = (S2 + TPB - 1) / TPB;
+    constexpr int NPER_S3 = (S3 + TPB - 1) / TPB;
 
-        # ── load operators (M*K = 32 elements) ──────────────────────
-        if tid < MK:
-            m = tid // K
-            k = tid % K
-            sAr[tid] = Ar[m, k]
-            sAs[tid] = As[m, k]
-            sAt[tid] = At[m, k]
+    __shared__ double sAt[MK], sAs[MK], sAr[MK];
+    __shared__ double sB[K3];
+    __shared__ double tmpK[S1];
+    __shared__ double tmpJ[S2];
 
-        # ── load B[n] (K^3 = 64 elements) ───────────────────────────
-        if tid < K3:
-            sB[tid] = B[n, tid // (K * K), (tid // K) % K, tid % K]
+    // ── Load operators (M*K elements, cooperative) ──────────────
+    if (tid < MK) {
+        sAr[tid] = Ar[tid];
+        sAs[tid] = As[tid];
+        sAt[tid] = At[tid];
+    }
 
-        cuda.syncthreads()
+    // ── Load B[n] (K^3 elements) ────────────────────────────────
+    if (tid < K3) {
+        sB[tid] = B[n * K3 + tid];
+    }
 
-        # ── Stage 1: tmpK[i,j,m] = sum_kk At[m,kk] * B[i,j,kk] ────
-        # S1 = TPB so exactly one output per thread
-        m  = tid % M
-        j1 = (tid // M) % K
-        i1 = tid // (M * K)
-        acc = 0.0
-        for kk in range(K):
-            acc += sAt[m * K + kk] * sB[i1 * K * K + j1 * K + kk]
-        tmpK[tid] = acc
+    __syncthreads();
 
-        cuda.syncthreads()
+    // ── Stage 1: tmpK[i,j,m] = sum_k At[m,k] * B[i,j,k] ──────
+    {
+        const int m  = tid % M;
+        const int j  = (tid / M) % K;
+        const int i  = tid / (M * K);
+        double acc = 0.0;
+        #pragma unroll
+        for (int kk = 0; kk < K; ++kk) {
+            acc += sAt[m * K + kk] * sB[i * K * K + j * K + kk];
+        }
+        tmpK[tid] = acc;  // layout: [i][j][m]
+    }
 
-        # ── Stage 2: tmpJ[i,b,c] = sum_jj As[b,jj] * tmpK[i,jj,c] ─
-        for t in range(nper_s2):
-            idx = tid + t * TPB
-            if idx < S2:
-                c  = idx % M
-                b  = (idx // M) % M
-                i2 = idx // (M * M)
-                acc = 0.0
-                for jj in range(K):
-                    acc += sAs[b * K + jj] * tmpK[i2 * K * M + jj * M + c]
-                tmpJ[idx] = acc
+    __syncthreads();
 
-        cuda.syncthreads()
+    // ── Stage 2: tmpJ[i,b,c] = sum_j As[b,j] * tmpK[i,j,c] ───
+    #pragma unroll
+    for (int t = 0; t < NPER_S2; ++t) {
+        const int idx = tid + t * TPB;
+        if (idx < S2) {
+            const int c  = idx % M;
+            const int b  = (idx / M) % M;
+            const int i  = idx / (M * M);
+            double acc = 0.0;
+            #pragma unroll
+            for (int jj = 0; jj < K; ++jj) {
+                acc += sAs[b * K + jj] * tmpK[i * K * M + jj * M + c];
+            }
+            tmpJ[idx] = acc;  // layout: [i][b][c]
+        }
+    }
 
-        # ── Stage 3: C[n,a,b,c] = sum_ii Ar[a,ii] * tmpJ[ii,b,c] ──
-        for t in range(nper_s3):
-            idx = tid + t * TPB
-            if idx < S3:
-                c = idx % M
-                b = (idx // M) % M
-                a = idx // (M * M)
-                acc = 0.0
-                for ii in range(K):
-                    acc += sAr[a * K + ii] * tmpJ[ii * M * M + b * M + c]
-                C[n, a, b, c] = acc
+    __syncthreads();
 
-    return _kernel, TPB
+    // ── Stage 3: C[n,a,b,c] = sum_i Ar[a,i] * tmpJ[i,b,c] ────
+    #pragma unroll
+    for (int t = 0; t < NPER_S3; ++t) {
+        const int idx = tid + t * TPB;
+        if (idx < S3) {
+            const int c = idx % M;
+            const int b = (idx / M) % M;
+            const int a = idx / (M * M);
+            double acc = 0.0;
+            #pragma unroll
+            for (int ii = 0; ii < K; ++ii) {
+                acc += sAr[a * K + ii] * tmpJ[ii * M * M + b * M + c];
+            }
+            C[n * S3 + idx] = acc;
+        }
+    }
+}
+
+// ── Dispatch wrapper (selects template instantiation) ───────────
+torch::Tensor fused_tp_forward(
+    torch::Tensor Ar, torch::Tensor As, torch::Tensor At,
+    torch::Tensor B, int M_val, int K_val)
+{
+    const int N = B.size(0);
+    auto C = torch::empty({N, M_val, M_val, M_val},
+                          B.options().dtype(torch::kFloat64));
+    const int TPB = K_val * K_val * M_val;
+
+    // Template dispatch for common (M, K) pairs
+    #define DISPATCH(MM, KK) \
+        if (M_val == MM && K_val == KK) { \
+            fused_tp_kernel<MM, KK><<<N, TPB>>>( \
+                Ar.data_ptr<double>(), As.data_ptr<double>(), \
+                At.data_ptr<double>(), B.data_ptr<double>(), \
+                C.data_ptr<double>(), N); \
+        }
+
+    DISPATCH(8, 4)
+    else DISPATCH(4, 8)
+    else DISPATCH(6, 3)
+    else DISPATCH(4, 4)
+    else DISPATCH(8, 8)
+    else DISPATCH(16, 8)
+    else DISPATCH(3, 6)
+    else DISPATCH(10, 5)
+    else {
+        TORCH_CHECK(false,
+            "fused_tp_kernel: no template instantiation for M=",
+            M_val, " K=", K_val,
+            ". Add DISPATCH(", M_val, ", ", K_val, ") to the source.");
+    }
+    #undef DISPATCH
+
+    return C;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("forward", &fused_tp_forward, "Fused tensor product (CUDA)");
+}
+"""
+
+_cuda_ext = None
+
+def _get_cuda_ext():
+    """Lazily compile the CUDA extension on first use."""
+    global _cuda_ext
+    if _cuda_ext is None:
+        print("  Compiling CUDA C++ fused kernel (first run only)...")
+        _cuda_ext = load_inline(
+            name='fused_tp',
+            cpp_sources='',
+            cuda_sources=_CUDA_KERNEL_SRC,
+            functions=['forward'],
+            extra_cuda_cflags=['-O3', '--use_fast_math'],
+            verbose=False,
+        )
+    return _cuda_ext
 
 
-def numba_tensor_product(Ar, As, At, B, M, K, N):
-    """Run the Numba CUDA fused kernel.  Inputs are numpy arrays on host;
-    returns a torch CUDA tensor for consistency with other benchmarks."""
-    kernel, TPB = make_numba_tp_kernel(M, K)
-
-    # Transfer to device as contiguous float64 arrays
-    d_Ar = cuda.to_device(np.ascontiguousarray(Ar))
-    d_As = cuda.to_device(np.ascontiguousarray(As))
-    d_At = cuda.to_device(np.ascontiguousarray(At))
-    d_B  = cuda.to_device(np.ascontiguousarray(B))
-    d_C  = cuda.device_array((N, M, M, M), dtype=np.float64)
-
-    kernel[N, TPB](d_Ar, d_As, d_At, d_B, d_C, N)
-    cuda.synchronize()
-
-    # Wrap result as a torch tensor (zero-copy via __cuda_array_interface__)
-    return torch.as_tensor(d_C, device='cuda')
-
-
-class NumbaGraphed:
-    """Pre-compiled Numba kernel with pre-allocated device arrays for timing."""
-
-    def __init__(self, Ar, As, At, B, M, K, N):
-        self.kernel, self.TPB = make_numba_tp_kernel(M, K)
-        self.N = N
-        self.d_Ar = cuda.to_device(np.ascontiguousarray(Ar))
-        self.d_As = cuda.to_device(np.ascontiguousarray(As))
-        self.d_At = cuda.to_device(np.ascontiguousarray(At))
-        self.d_B  = cuda.to_device(np.ascontiguousarray(B))
-        self.d_C  = cuda.device_array((N, M, M, M), dtype=np.float64)
-        # Warm up (JIT compile)
-        self.kernel[N, self.TPB](self.d_Ar, self.d_As, self.d_At,
-                                  self.d_B, self.d_C, N)
-        cuda.synchronize()
-
-    def run(self):
-        self.kernel[self.N, self.TPB](
-            self.d_Ar, self.d_As, self.d_At, self.d_B, self.d_C, self.N)
-
-    def get_C(self):
-        return torch.as_tensor(self.d_C, device='cuda')
+def cuda_fused_tensor_product(Ar, As, At, B, M, K):
+    """Run the CUDA C++ fused kernel.  All tensors must be contiguous on CUDA."""
+    ext = _get_cuda_ext()
+    return ext.forward(Ar.contiguous(), As.contiguous(),
+                       At.contiguous(), B.contiguous(), M, K)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -455,21 +497,19 @@ def main():
     except Exception as e:
         print(f"  CUDA graph capture failed: {e}")
 
-    # ── Numba CUDA kernel ────────────────────────────────────────────
-    if not HAS_NUMBA:
-        print("\nNumba not installed — skipping Numba benchmark.")
-        print("  Install with: pip install numba")
+    # ── CUDA C++ fused kernel (shared mem + syncthreads) ─────────────
+    if not HAS_CUDA_EXT:
+        print("\ntorch.utils.cpp_extension not available — skipping CUDA fused kernel.")
     else:
-        print("\n--- Numba CUDA (shared mem + syncthreads) ---")
+        print("\n--- CUDA C++ fused (shared mem + syncthreads) ---")
         try:
-            C_numba = numba_tensor_product(Ar, As, At, B, M, K, N)
-            validate("Numba CUDA", C_cpu, C_numba, tol)
-
-            # For fair timing, use pre-allocated device arrays
-            nb = NumbaGraphed(Ar, As, At, B, M, K, N)
-            report_time(bench(nb.run, ntrys))
+            C_fused = cuda_fused_tensor_product(Ar_t, As_t, At_t, B_t, M, K)
+            torch.cuda.synchronize()
+            validate("CUDA fused", C_cpu, C_fused, tol)
+            report_time(bench(cuda_fused_tensor_product, ntrys,
+                              Ar_t, As_t, At_t, B_t, M, K))
         except Exception as e:
-            print(f"  Numba CUDA failed: {e}")
+            print(f"  CUDA fused kernel failed: {e}")
 
 
 if __name__ == '__main__':
