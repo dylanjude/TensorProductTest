@@ -19,6 +19,12 @@ try:
 except ImportError:
     HAS_TRITON = False
 
+try:
+    from numba import cuda, float64
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+
 # ─────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────
@@ -214,6 +220,138 @@ class TritonGraphed:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Numba CUDA kernel — shared memory, syncthreads (mirrors OCCA)
+# ─────────────────────────────────────────────────────────────────────
+# One block per batch element, K*K*M threads per block.
+# Operators and B loaded into shared memory.  Intermediates (tmpK, tmpJ)
+# live entirely in shared memory with syncthreads between stages.
+# Each thread handles multiple outputs in stages 2 and 3.
+
+def make_numba_tp_kernel(M, K):
+    """Build a Numba CUDA kernel specialised for given M, K."""
+    TPB = K * K * M          # threads per block (128 for M=8, K=4)
+    S1  = K * K * M          # stage 1 outputs per slice
+    S2  = K * M * M          # stage 2 outputs per slice
+    S3  = M * M * M          # stage 3 outputs per slice
+    MK  = M * K              # operator size
+    K3  = K * K * K           # B slice size
+    nper_s2 = (S2 + TPB - 1) // TPB   # outputs per thread, stage 2
+    nper_s3 = (S3 + TPB - 1) // TPB   # outputs per thread, stage 3
+
+    @cuda.jit
+    def _kernel(Ar, As, At, B, C, N):
+        n = cuda.blockIdx.x
+        if n >= N:
+            return
+        tid = cuda.threadIdx.x
+
+        # ── shared memory ────────────────────────────────────────────
+        sAt = cuda.shared.array(shape=(MK,), dtype=float64)
+        sAs = cuda.shared.array(shape=(MK,), dtype=float64)
+        sAr = cuda.shared.array(shape=(MK,), dtype=float64)
+        sB  = cuda.shared.array(shape=(K3,), dtype=float64)
+        tmpK = cuda.shared.array(shape=(S1,), dtype=float64)
+        tmpJ = cuda.shared.array(shape=(S2,), dtype=float64)
+
+        # ── load operators (M*K = 32 elements) ──────────────────────
+        if tid < MK:
+            m = tid // K
+            k = tid % K
+            sAr[tid] = Ar[m, k]
+            sAs[tid] = As[m, k]
+            sAt[tid] = At[m, k]
+
+        # ── load B[n] (K^3 = 64 elements) ───────────────────────────
+        if tid < K3:
+            sB[tid] = B[n, tid // (K * K), (tid // K) % K, tid % K]
+
+        cuda.syncthreads()
+
+        # ── Stage 1: tmpK[i,j,m] = sum_kk At[m,kk] * B[i,j,kk] ────
+        # S1 = TPB so exactly one output per thread
+        m  = tid % M
+        j1 = (tid // M) % K
+        i1 = tid // (M * K)
+        acc = 0.0
+        for kk in range(K):
+            acc += sAt[m * K + kk] * sB[i1 * K * K + j1 * K + kk]
+        tmpK[tid] = acc
+
+        cuda.syncthreads()
+
+        # ── Stage 2: tmpJ[i,b,c] = sum_jj As[b,jj] * tmpK[i,jj,c] ─
+        for t in range(nper_s2):
+            idx = tid + t * TPB
+            if idx < S2:
+                c  = idx % M
+                b  = (idx // M) % M
+                i2 = idx // (M * M)
+                acc = 0.0
+                for jj in range(K):
+                    acc += sAs[b * K + jj] * tmpK[i2 * K * M + jj * M + c]
+                tmpJ[idx] = acc
+
+        cuda.syncthreads()
+
+        # ── Stage 3: C[n,a,b,c] = sum_ii Ar[a,ii] * tmpJ[ii,b,c] ──
+        for t in range(nper_s3):
+            idx = tid + t * TPB
+            if idx < S3:
+                c = idx % M
+                b = (idx // M) % M
+                a = idx // (M * M)
+                acc = 0.0
+                for ii in range(K):
+                    acc += sAr[a * K + ii] * tmpJ[ii * M * M + b * M + c]
+                C[n, a, b, c] = acc
+
+    return _kernel, TPB
+
+
+def numba_tensor_product(Ar, As, At, B, M, K, N):
+    """Run the Numba CUDA fused kernel.  Inputs are numpy arrays on host;
+    returns a torch CUDA tensor for consistency with other benchmarks."""
+    kernel, TPB = make_numba_tp_kernel(M, K)
+
+    # Transfer to device as contiguous float64 arrays
+    d_Ar = cuda.to_device(np.ascontiguousarray(Ar))
+    d_As = cuda.to_device(np.ascontiguousarray(As))
+    d_At = cuda.to_device(np.ascontiguousarray(At))
+    d_B  = cuda.to_device(np.ascontiguousarray(B))
+    d_C  = cuda.device_array((N, M, M, M), dtype=np.float64)
+
+    kernel[N, TPB](d_Ar, d_As, d_At, d_B, d_C, N)
+    cuda.synchronize()
+
+    # Wrap result as a torch tensor (zero-copy via __cuda_array_interface__)
+    return torch.as_tensor(d_C, device='cuda')
+
+
+class NumbaGraphed:
+    """Pre-compiled Numba kernel with pre-allocated device arrays for timing."""
+
+    def __init__(self, Ar, As, At, B, M, K, N):
+        self.kernel, self.TPB = make_numba_tp_kernel(M, K)
+        self.N = N
+        self.d_Ar = cuda.to_device(np.ascontiguousarray(Ar))
+        self.d_As = cuda.to_device(np.ascontiguousarray(As))
+        self.d_At = cuda.to_device(np.ascontiguousarray(At))
+        self.d_B  = cuda.to_device(np.ascontiguousarray(B))
+        self.d_C  = cuda.device_array((N, M, M, M), dtype=np.float64)
+        # Warm up (JIT compile)
+        self.kernel[N, self.TPB](self.d_Ar, self.d_As, self.d_At,
+                                  self.d_B, self.d_C, N)
+        cuda.synchronize()
+
+    def run(self):
+        self.kernel[self.N, self.TPB](
+            self.d_Ar, self.d_As, self.d_At, self.d_B, self.d_C, self.N)
+
+    def get_C(self):
+        return torch.as_tensor(self.d_C, device='cuda')
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────
 
@@ -308,6 +446,22 @@ def main():
         report_time(bench(graphed.replay, ntrys))
     except Exception as e:
         print(f"  CUDA graph capture failed: {e}")
+
+    # ── Numba CUDA kernel ────────────────────────────────────────────
+    if not HAS_NUMBA:
+        print("\nNumba not installed — skipping Numba benchmark.")
+        print("  Install with: pip install numba")
+    else:
+        print("\n--- Numba CUDA (shared mem + syncthreads) ---")
+        try:
+            C_numba = numba_tensor_product(Ar, As, At, B, M, K, N)
+            validate("Numba CUDA", C_cpu, C_numba, tol)
+
+            # For fair timing, use pre-allocated device arrays
+            nb = NumbaGraphed(Ar, As, At, B, M, K, N)
+            report_time(bench(nb.run, ntrys))
+        except Exception as e:
+            print(f"  Numba CUDA failed: {e}")
 
 
 if __name__ == '__main__':
