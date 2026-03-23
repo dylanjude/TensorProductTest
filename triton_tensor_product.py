@@ -33,6 +33,25 @@ def next_power_of_2(n):
     return n + 1
 
 
+def bench(fn, ntrys, *args):
+    """Warm up (3 iters), then time ntrys iterations.  Returns seconds/iter."""
+    for _ in range(3):
+        fn(*args)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(ntrys):
+        fn(*args)
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / ntrys
+
+
+def validate(label, C_cpu, C_gpu, tol=1e-12):
+    diff = np.max(np.abs(C_cpu - C_gpu.cpu().numpy()))
+    status = "PASS" if diff <= tol else "FAIL"
+    print(f"  CPU vs {label:20s} max|diff| = {diff:.3e}  [{status}]")
+    return diff <= tol
+
+
 # ─────────────────────────────────────────────────────────────────────
 # CPU reference (numpy einsum, 3‑stage sum‑factorised)
 # ─────────────────────────────────────────────────────────────────────
@@ -58,6 +77,13 @@ def torch_tensor_product(Ar, As, At, B):
     tmp2 = torch.einsum('mj,nijc->nimc', As, tmp1)
     C    = torch.einsum('mi,nibc->nmbc', Ar, tmp2)
     return C
+
+
+# ─────────────────────────────────────────────────────────────────────
+# torch.compile'd einsum
+# ─────────────────────────────────────────────────────────────────────
+
+torch_tensor_product_compiled = torch.compile(torch_tensor_product)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -152,141 +178,39 @@ def triton_tensor_product(Ar, As, At, B, M, K, N):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Triton fused kernel — single launch, no intermediate buffers
+# CUDA graph wrapper for Triton 3-stage
 # ─────────────────────────────────────────────────────────────────────
-# Vectorizes over all M*M*M output elements (a,b,c) — 512 lanes for
-# M=8, giving 16 warps per program.  Loops over contraction indices
-# (i,j,k) via tl.static_range with the innermost k loop partially
-# sum-factorized.  Operator matrices (Ar,As,At) are tiny and stay in
-# L1; B values are scalar broadcasts.  No global memory intermediates.
 
-if HAS_TRITON:
+class TritonGraphed:
+    """Captures the 3-stage Triton launch sequence as a CUDA graph."""
 
-    @triton.jit
-    def _fused_tp_kernel(
-        Ar_ptr, As_ptr, At_ptr, B_ptr, C_ptr,
-        N: tl.constexpr, M: tl.constexpr, K: tl.constexpr,
-        BLOCK: tl.constexpr,
-    ):
-        n = tl.program_id(0)
-        offs = tl.arange(0, BLOCK)
-        mask = offs < M * M * M
-        c = offs % M
-        b = (offs // M) % M
-        a = offs // (M * M)
+    def __init__(self, Ar, As, At, B, M, K, N):
+        BLOCK1 = next_power_of_2(K * K * M)
+        BLOCK2 = next_power_of_2(K * M * M)
+        BLOCK3 = next_power_of_2(M * M * M)
+        grid = (N,)
 
-        acc = tl.zeros([BLOCK], dtype=tl.float64)
+        # Pre-allocate all buffers (reused across replays)
+        self.tmp1 = torch.empty((N, K, K, M), dtype=torch.float64, device='cuda')
+        self.tmp2 = torch.empty((N, K, M, M), dtype=torch.float64, device='cuda')
+        self.C    = torch.empty((N, M, M, M), dtype=torch.float64, device='cuda')
 
-        for i in tl.static_range(K):
-            ar_val = tl.load(Ar_ptr + a * K + i, mask=mask)
-            for j in tl.static_range(K):
-                as_val = tl.load(As_ptr + b * K + j, mask=mask)
-                ar_as = ar_val * as_val
+        # Warm up the kernels before capture
+        _stage1_kernel[grid](At, B, self.tmp1, N, M, K, BLOCK1)
+        _stage2_kernel[grid](As, self.tmp1, self.tmp2, N, M, K, BLOCK2)
+        _stage3_kernel[grid](Ar, self.tmp2, self.C, N, M, K, BLOCK3)
+        torch.cuda.synchronize()
 
-                # partial sum-factorization: accumulate k contraction first
-                tmp = tl.zeros([BLOCK], dtype=tl.float64)
-                for k in tl.static_range(K):
-                    at_val = tl.load(At_ptr + c * K + k, mask=mask)
-                    b_val = tl.load(B_ptr + n * K*K*K + i * K*K + j * K + k)
-                    tmp += at_val * b_val
+        # Capture
+        self._graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._graph):
+            _stage1_kernel[grid](At, B, self.tmp1, N, M, K, BLOCK1)
+            _stage2_kernel[grid](As, self.tmp1, self.tmp2, N, M, K, BLOCK2)
+            _stage3_kernel[grid](Ar, self.tmp2, self.C, N, M, K, BLOCK3)
 
-                acc += ar_as * tmp
-
-        tl.store(C_ptr + n * M*M*M + offs, acc, mask=mask)
-
-
-def triton_tensor_product_fused(Ar, As, At, B, M, K, N):
-    """Fused single-kernel tensor product.  All tensors must be on CUDA."""
-    BLOCK = next_power_of_2(M * M * M)
-    C = torch.empty((N, M, M, M), dtype=torch.float64, device='cuda')
-    _fused_tp_kernel[(N,)](Ar, As, At, B, C, N, M, K, BLOCK)
-    return C
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Triton fused 3-stage kernel — single launch, true sum-factorization
-# ─────────────────────────────────────────────────────────────────────
-# Runs all three contraction stages sequentially within one program.
-# Intermediates go through global memory scratch buffers, but since
-# the same program writes then immediately reads back, the data stays
-# in L1 cache.  This gives: single kernel launch (no overhead), true
-# sum-factorization (minimal FLOPs), and L1-cached intermediates.
-
-if HAS_TRITON:
-
-    @triton.jit
-    def _fused_3stage_kernel(
-        Ar_ptr, As_ptr, At_ptr, B_ptr, C_ptr,
-        tmp1_ptr, tmp2_ptr,
-        N: tl.constexpr, M: tl.constexpr, K: tl.constexpr,
-        S1: tl.constexpr,   # K*K*M  (stage 1 output size per slice)
-        S2: tl.constexpr,   # K*M*M  (stage 2 output size per slice)
-        S3: tl.constexpr,   # M*M*M  (stage 3 output size per slice)
-        BLOCK: tl.constexpr,
-    ):
-        n = tl.program_id(0)
-        offs = tl.arange(0, BLOCK)
-
-        # ── Stage 1: tmp1[i,j,m] = sum_k At[m,k] * B[n,i,j,k] ──────
-        mask1 = offs < S1
-        m1 = offs % M
-        tmp = offs // M
-        j1 = tmp % K
-        i1 = tmp // K
-
-        acc1 = tl.zeros([BLOCK], dtype=tl.float64)
-        for kk in tl.static_range(K):
-            at_val = tl.load(At_ptr + m1 * K + kk, mask=mask1)
-            b_val = tl.load(B_ptr + n * K*K*K + i1 * K*K + j1 * K + kk, mask=mask1)
-            acc1 += at_val * b_val
-        tl.store(tmp1_ptr + n * S1 + offs, acc1, mask=mask1)
-
-        # ── Stage 2: tmp2[i,b,c] = sum_j As[b,j] * tmp1[i,j,c] ─────
-        mask2 = offs < S2
-        c2 = offs % M
-        tmp = offs // M
-        b2 = tmp % M
-        i2 = tmp // M
-
-        acc2 = tl.zeros([BLOCK], dtype=tl.float64)
-        for jj in tl.static_range(K):
-            as_val = tl.load(As_ptr + b2 * K + jj, mask=mask2)
-            in_val = tl.load(tmp1_ptr + n * S1 + i2 * K * M + jj * M + c2, mask=mask2)
-            acc2 += as_val * in_val
-        tl.store(tmp2_ptr + n * S2 + offs, acc2, mask=mask2)
-
-        # ── Stage 3: C[a,b,c] = sum_i Ar[a,i] * tmp2[i,b,c] ────────
-        mask3 = offs < S3
-        c3 = offs % M
-        tmp = offs // M
-        b3 = tmp % M
-        a3 = tmp // M
-
-        acc3 = tl.zeros([BLOCK], dtype=tl.float64)
-        for ii in tl.static_range(K):
-            ar_val = tl.load(Ar_ptr + a3 * K + ii, mask=mask3)
-            in_val = tl.load(tmp2_ptr + n * S2 + ii * M * M + b3 * M + c3, mask=mask3)
-            acc3 += ar_val * in_val
-        tl.store(C_ptr + n * S3 + offs, acc3, mask=mask3)
-
-
-def triton_tensor_product_fused_3stage(Ar, As, At, B, M, K, N):
-    """Fused 3-stage kernel: single launch, true sum-factorization,
-    intermediates cached in L1.  All tensors must be on CUDA."""
-    S1 = K * K * M
-    S2 = K * M * M
-    S3 = M * M * M
-    BLOCK = next_power_of_2(max(S1, S2, S3))
-
-    tmp1 = torch.empty((N, S1), dtype=torch.float64, device='cuda')
-    tmp2 = torch.empty((N, S2), dtype=torch.float64, device='cuda')
-    C    = torch.empty((N, M, M, M), dtype=torch.float64, device='cuda')
-
-    _fused_3stage_kernel[(N,)](
-        Ar, As, At, B, C, tmp1, tmp2,
-        N, M, K, S1, S2, S3, BLOCK,
-    )
-    return C
+    def replay(self):
+        self._graph.replay()
+        return self.C
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -305,6 +229,9 @@ def main():
 
     print(f"M={M}, K={K}, N={N}, ntrys={ntrys}")
     FLOP = N * (K*K*M + K*M*M + M*M*M) * 2 * K
+
+    def report_time(dt):
+        print(f"  time = {dt:.4e} s   TFLOPS = {FLOP / dt / 1e12:.3f}")
 
     # ── data generation ──────────────────────────────────────────────
     rng = np.random.default_rng(seed=42)
@@ -331,104 +258,56 @@ def main():
     As_t = torch.from_numpy(As).cuda()
     At_t = torch.from_numpy(At).cuda()
     B_t  = torch.from_numpy(B).cuda()
+    tol = 1e-12
 
     # ── torch.einsum on GPU ──────────────────────────────────────────
     print("\n--- torch.einsum GPU ---")
     C_torch = torch_tensor_product(Ar_t, As_t, At_t, B_t)
     torch.cuda.synchronize()
+    validate("torch.einsum", C_cpu, C_torch, tol)
+    report_time(bench(torch_tensor_product, ntrys, Ar_t, As_t, At_t, B_t))
 
-    diff_torch = np.max(np.abs(C_cpu - C_torch.cpu().numpy()))
-    tol = 1e-12
-    status = "PASS" if diff_torch <= tol else "FAIL"
-    print(f"  CPU vs torch.einsum  max|diff| = {diff_torch:.3e}  [{status}]")
-
-    # warm-up + timing
-    for _ in range(3):
-        torch_tensor_product(Ar_t, As_t, At_t, B_t)
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(ntrys):
-        torch_tensor_product(Ar_t, As_t, At_t, B_t)
-    torch.cuda.synchronize()
-    dt_torch = (time.perf_counter() - t0) / ntrys
-    print(f"  time = {dt_torch:.4e} s   TFLOPS = {FLOP / dt_torch / 1e12:.3f}")
+    # ── torch.compile'd einsum ───────────────────────────────────────
+    print("\n--- torch.compile(einsum) GPU ---")
+    try:
+        # Compilation happens on first call; run a few warm-ups
+        for _ in range(3):
+            torch_tensor_product_compiled(Ar_t, As_t, At_t, B_t)
+        torch.cuda.synchronize()
+        C_compiled = torch_tensor_product_compiled(Ar_t, As_t, At_t, B_t)
+        torch.cuda.synchronize()
+        validate("torch.compile", C_cpu, C_compiled, tol)
+        report_time(bench(torch_tensor_product_compiled, ntrys,
+                          Ar_t, As_t, At_t, B_t))
+    except Exception as e:
+        print(f"  torch.compile failed: {e}")
 
     # ── Triton kernels ───────────────────────────────────────────────
     if not HAS_TRITON:
-        print("\nTriton not installed — skipping Triton benchmark.")
+        print("\nTriton not installed — skipping Triton benchmarks.")
         return
 
-    print("\n--- Triton kernels ---")
+    print("\n--- Triton 3-stage ---")
     try:
         C_tri = triton_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
         torch.cuda.synchronize()
-
-        diff_tri = np.max(np.abs(C_cpu - C_tri.cpu().numpy()))
-        status = "PASS" if diff_tri <= tol else "FAIL"
-        print(f"  CPU vs Triton        max|diff| = {diff_tri:.3e}  [{status}]")
-
-        # warm-up + timing
-        for _ in range(3):
-            triton_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(ntrys):
-            triton_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
-        torch.cuda.synchronize()
-        dt_tri = (time.perf_counter() - t0) / ntrys
-        print(f"  time = {dt_tri:.4e} s   TFLOPS = {FLOP / dt_tri / 1e12:.3f}")
-
+        validate("Triton 3-stage", C_cpu, C_tri, tol)
+        report_time(bench(triton_tensor_product, ntrys,
+                          Ar_t, As_t, At_t, B_t, M, K, N))
     except Exception as e:
         print(f"  Triton compilation failed (likely SM < 7.0): {e}")
-        print("  Falling back to torch.einsum results above.")
         return
 
-    # ── Triton fused kernel ──────────────────────────────────────────
-    print("\n--- Triton fused kernel ---")
+    # ── CUDA graph of Triton 3-stage ─────────────────────────────────
+    print("\n--- Triton 3-stage + CUDA graph ---")
     try:
-        C_fused = triton_tensor_product_fused(Ar_t, As_t, At_t, B_t, M, K, N)
+        graphed = TritonGraphed(Ar_t, As_t, At_t, B_t, M, K, N)
+        C_graphed = graphed.replay()
         torch.cuda.synchronize()
-
-        diff_fused = np.max(np.abs(C_cpu - C_fused.cpu().numpy()))
-        status = "PASS" if diff_fused <= tol else "FAIL"
-        print(f"  CPU vs Triton fused  max|diff| = {diff_fused:.3e}  [{status}]")
-
-        # warm-up + timing
-        for _ in range(3):
-            triton_tensor_product_fused(Ar_t, As_t, At_t, B_t, M, K, N)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(ntrys):
-            triton_tensor_product_fused(Ar_t, As_t, At_t, B_t, M, K, N)
-        torch.cuda.synchronize()
-        dt_fused = (time.perf_counter() - t0) / ntrys
-        print(f"  time = {dt_fused:.4e} s   TFLOPS = {FLOP / dt_fused / 1e12:.3f}")
-
+        validate("Triton+CUDAgraph", C_cpu, C_graphed, tol)
+        report_time(bench(graphed.replay, ntrys))
     except Exception as e:
-        print(f"  Triton fused compilation failed: {e}")
-
-    # ── Triton fused 3-stage kernel ──────────────────────────────────
-    print("\n--- Triton fused 3-stage kernel ---")
-    try:
-        C_f3 = triton_tensor_product_fused_3stage(Ar_t, As_t, At_t, B_t, M, K, N)
-        torch.cuda.synchronize()
-
-        diff_f3 = np.max(np.abs(C_cpu - C_f3.cpu().numpy()))
-        status = "PASS" if diff_f3 <= tol else "FAIL"
-        print(f"  CPU vs Triton f3stg  max|diff| = {diff_f3:.3e}  [{status}]")
-
-        for _ in range(3):
-            triton_tensor_product_fused_3stage(Ar_t, As_t, At_t, B_t, M, K, N)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(ntrys):
-            triton_tensor_product_fused_3stage(Ar_t, As_t, At_t, B_t, M, K, N)
-        torch.cuda.synchronize()
-        dt_f3 = (time.perf_counter() - t0) / ntrys
-        print(f"  time = {dt_f3:.4e} s   TFLOPS = {FLOP / dt_f3 / 1e12:.3f}")
-
-    except Exception as e:
-        print(f"  Triton fused 3-stage compilation failed: {e}")
+        print(f"  CUDA graph capture failed: {e}")
 
 
 if __name__ == '__main__':
