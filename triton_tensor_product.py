@@ -7,8 +7,16 @@ Usage:  python triton_tensor_product.py M K [--N 65536] [--ntrys 10]
 """
 
 import argparse
+import glob
+import os
 import time
 import numpy as np
+
+# Ensure venv-installed nvidia tools (ptxas) are found before system ones
+for _sp in __import__('site').getsitepackages():
+    for _p in glob.glob(os.path.join(_sp, 'nvidia', '*', 'bin')):
+        if _p not in os.environ.get('PATH', ''):
+            os.environ['PATH'] = _p + ':' + os.environ.get('PATH', '')
 
 import torch
 
