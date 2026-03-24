@@ -4,13 +4,13 @@
 #include <stdlib.h>
 #include <unordered_map>
 #include <vector>
-#ifdef DGX3D_HAS_CUDA
+#ifdef DGX3D_HAS_CUTENSOR
 #include <cutensor.h>
 #endif
 
 namespace dgx3d {
 // this does not compile yet
-#ifdef DGX3D_HAS_CUDA
+#ifdef DGX3D_HAS_CUTENSOR
 
 #define HANDLE_ERROR(x)                                                        \
   {                                                                            \

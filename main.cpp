@@ -8,6 +8,10 @@
 #include <occa.hpp>
 #include <random>
 #include <vector>
+#ifdef DGX3D_HAS_CUDA
+#include "TensorProductCUDA.hpp"
+#include <cuda_runtime.h>
+#endif
 #define TIMER 1
 #define NTRYS 10
 #define COMPARE 0
@@ -151,15 +155,59 @@ int main(int argc, char **argv) {
   maxAbsDiff(C_gemm, C_occa, "original", "occa");
 #endif
 
-  // TODO does not work yet
+  ///////////////////////////////////////////////////////////
+  // run native CUDA fused kernel (shared memory + syncthreads)
+  ///////////////////////////////////////////////////////////
+#ifdef DGX3D_HAS_CUDA
   if (use_gpu) {
-    ///////////////////////////////////////////////////////////
-    // run cutensor implementation
-    ///////////////////////////////////////////////////////////
-    cutensorWrap(device, M, N, K, Ar, As, At, B, C_cute);
+    std::vector<double> C_cuda((size_t)N * LDC, 0.0);
 
-    maxAbsDiff(C_gemm, C_cute, "original", "cutensor");
+    // Allocate device memory
+    double *d_Ar, *d_As, *d_At, *d_B, *d_C_cuda;
+    cudaMalloc(&d_Ar,     K * MPad * sizeof(double));
+    cudaMalloc(&d_As,     K * MPad * sizeof(double));
+    cudaMalloc(&d_At,     K * MPad * sizeof(double));
+    cudaMalloc(&d_B,      (size_t)N * LDB * sizeof(double));
+    cudaMalloc(&d_C_cuda, (size_t)N * LDC * sizeof(double));
+
+    cudaMemcpy(d_Ar, Ar.data(), K * MPad * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_As, As.data(), K * MPad * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_At, At.data(), K * MPad * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B,  B.data(),  (size_t)N * LDB * sizeof(double), cudaMemcpyHostToDevice);
+
+    // Warm up
+    launchFusedTPKernel(d_Ar, d_As, d_At, d_B, d_C_cuda, M, K, N, LDB, LDC);
+    cudaDeviceSynchronize();
+
+#if TIMER
+    Timer stopwatch_cuda;
+    stopwatch_cuda.tick();
+    for (int itry = 0; itry < NTRYS; itry++) {
+      launchFusedTPKernel(d_Ar, d_As, d_At, d_B, d_C_cuda, M, K, N, LDB, LDC);
+    }
+    double duration_cuda = stopwatch_cuda.tock() / NTRYS;
+    double FLOP_cuda = (double)N * 2.0 * K * ((double)K*K*M + (double)K*M*M + (double)M*M*M);
+    double TFLOPS_cuda = FLOP_cuda / duration_cuda / 1e12;
+    printf("Native CUDA fused kernel Compute time = %e TFLOPS=%.2f\n", duration_cuda, TFLOPS_cuda);
+#endif
+
+    // Copy back and validate
+    cudaMemcpy(C_cuda.data(), d_C_cuda, (size_t)N * LDC * sizeof(double), cudaMemcpyDeviceToHost);
+    maxAbsDiff(C_gemm, C_cuda, "gemm", "native CUDA fused");
+
+    cudaFree(d_Ar);
+    cudaFree(d_As);
+    cudaFree(d_At);
+    cudaFree(d_B);
+    cudaFree(d_C_cuda);
   }
+#endif
+
+  // cuTENSOR — disabled (requires DGX3D_HAS_CUTENSOR)
+  // if (use_gpu) {
+  //   cutensorWrap(device, M, N, K, Ar, As, At, B, C_cute);
+  //   maxAbsDiff(C_gemm, C_cute, "original", "cutensor");
+  // }
 
   // compare
 #if COMPARE

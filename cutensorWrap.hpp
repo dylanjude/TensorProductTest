@@ -2,7 +2,7 @@ void cutensorWrap(occa::device &device, int M, int N, int K,
                   const std::vector<double> &Ar, const std::vector<double> &As,
                   const std::vector<double> &At, const std::vector<double> &B,
                   std::vector<double> &C) {
-#ifdef DGX3D_HAS_CUDA
+#ifdef DGX3D_HAS_CUTENSOR
   occa::memory d_Ar = device.malloc<double>(Ar.size(), Ar.data());
   occa::memory d_As = device.malloc<double>(As.size(), As.data());
   occa::memory d_At = device.malloc<double>(At.size(), At.data());

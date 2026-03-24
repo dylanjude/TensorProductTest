@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.18)
 project(TensorProductVolumeOCCA LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -11,7 +11,9 @@ find_package(OCCA REQUIRED)
 find_package(CUDAToolkit QUIET)
 
 if(CUDAToolkit_FOUND)
-  message(STATUS "CUDA toolkit found — enabling GPU paths (cuBLAS, OCCA/CUDA)")
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 17)
+  message(STATUS "CUDA toolkit found — enabling GPU paths (cuBLAS, OCCA/CUDA, native CUDA kernel)")
   set(USE_CUDA TRUE)
 else()
   message(STATUS "CUDA toolkit not found — building CPU-only")
@@ -32,7 +34,14 @@ find_package(LAPACK REQUIRED)
 get_filename_component(DGX3D_OKL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/okl" ABSOLUTE)
 
 # ── Executable ────────────────────────────────────────────────────────
-add_executable(tensor_product_volume main.cpp Timer.cpp gemm.cpp)
+if(USE_CUDA)
+  add_executable(tensor_product_volume main.cpp Timer.cpp gemm.cpp TensorProductCUDA.cu)
+  set_source_files_properties(TensorProductCUDA.cu PROPERTIES
+    COMPILE_FLAGS "-O3 --use_fast_math"
+  )
+else()
+  add_executable(tensor_product_volume main.cpp Timer.cpp gemm.cpp)
+endif()
 
 target_compile_definitions(tensor_product_volume PRIVATE
   DGX3D_OKL_DIR="${DGX3D_OKL_DIR}"
