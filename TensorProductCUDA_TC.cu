@@ -11,12 +11,18 @@
 //   Stage 1: T1[m,j,i]   = sum_k At[m,k] * B[i,j,k]       — 2 MMA ops
 //   Stage 2: T2[b,c,i]   = sum_j As[b,j] * T1[c,j,i]      — K MMA ops
 //   Stage 3: C[a,b,c]    = sum_i Ar[a,i] * T2[b,c,i]       — M MMA ops
+//
+// Bank-conflict reduction via XOR permutation (Cui 2024, Fig. 4):
+//   tmpK stored at (m ^ j)  + M*j + M*K*i   instead of m + M*j + M*K*i
+//   tmpJ stored at (c ^ b ^ i) + M*b + M*M*i instead of c + M*b + M*M*i
+// This reduces stage 3 shared-memory bank conflicts from 16-way to 2-way
+// (2-way is the theoretical minimum for 32 threads accessing M=8 doubles).
 // =====================================================================
 
 #include "TensorProductCUDA_TC.hpp"
 #include <cstdio>
 
-static constexpr int WARPS_PER_BLOCK_TC = 8;
+static constexpr int WARPS_PER_BLOCK_TC = 4;
 
 template <int M, int K>
 __global__ void fused_tp_tc_kernel(
@@ -87,8 +93,9 @@ __global__ void fused_tp_tc_kernel(
     const double a_Ar = sAr[(lane % 4) * M + (lane / 4)];
 
     // ═══════════════════════════════════════════════════════════════════
-    // Stage 1: tmpK[m + M*j + M*K*i] = sum_k At[m,k] * B[i + K*j + K²*k]
+    // Stage 1: tmpK[(m^j) + M*j + M*K*i] = sum_k At[m,k] * B[i + K*j + K²*k]
     //   MMA: At(8×4) × B_batch(4×8) → D(8×8), 2 batches of 8 (i,j) pairs
+    //   XOR permutation on first index: physical = (m ^ j)
     // ═══════════════════════════════════════════════════════════════════
     #pragma unroll
     for (int batch = 0; batch < NUM_BATCHES_S1; ++batch) {
@@ -117,21 +124,26 @@ __global__ void fused_tp_tc_kernel(
         // Map output column back to (i, j)
         const int i0 = 2 * batch + col0 / K, j0 = col0 % K;
         const int i1 = 2 * batch + col1 / K, j1 = col1 % K;
-        tmpK[m + M * j0 + M * K * i0] = d0;
-        tmpK[m + M * j1 + M * K * i1] = d1;
+        // XOR permutation: store at (m ^ j) instead of m
+        tmpK[(m ^ j0) + M * j0 + M * K * i0] = d0;
+        tmpK[(m ^ j1) + M * j1 + M * K * i1] = d1;
     }
 
     __syncwarp();
 
     // ═══════════════════════════════════════════════════════════════════
-    // Stage 2: tmpJ[c + M*b + M²*i] = sum_j As[b,j] * tmpK[c + M*j + M*K*i]
+    // Stage 2: tmpJ[(c^b^ii) + M*b + M²*ii] = sum_j As[b,j] * tmpK[(c^j) + M*j + M*K*ii]
     //   MMA: As(8×4) × tmpK_i^T(4×8) → D(8×8), one per i value (K=4 calls)
+    //   XOR permutation on tmpK read: physical = (c ^ j)
+    //   XOR permutation on tmpJ write: physical = (c ^ b ^ ii)
     // ═══════════════════════════════════════════════════════════════════
     #pragma unroll
     for (int ii = 0; ii < K; ++ii) {
-        // B fragment: tmpK_i transposed → B[j][c] = tmpK[c + M*j + M*K*ii]
+        // B fragment: tmpK_i transposed → B[j][c] = tmpK[(c^j) + M*j + M*K*ii]
         // Thread lane: row = lane%4 = j, col = lane/4 = c
-        const double b_val = tmpK[(lane / 4) + M * (lane % 4) + M * K * ii];
+        const int c_rd = lane / 4;
+        const int j_rd = lane % 4;
+        const double b_val = tmpK[(c_rd ^ j_rd) + M * j_rd + M * K * ii];
 
         double c0 = 0.0, c1 = 0.0;
         double d0, d1;
@@ -147,21 +159,26 @@ __global__ void fused_tp_tc_kernel(
         const int b_idx  = lane / 4;
         const int c0_idx = (lane % 4) * 2;
         const int c1_idx = c0_idx + 1;
-        tmpJ[c0_idx + M * b_idx + M * M * ii] = d0;
-        tmpJ[c1_idx + M * b_idx + M * M * ii] = d1;
+        // XOR permutation: store at (c ^ b ^ ii) instead of c
+        tmpJ[(c0_idx ^ b_idx ^ ii) + M * b_idx + M * M * ii] = d0;
+        tmpJ[(c1_idx ^ b_idx ^ ii) + M * b_idx + M * M * ii] = d1;
     }
 
     __syncwarp();
 
     // ═══════════════════════════════════════════════════════════════════
-    // Stage 3: C[n*LDC + a + M*b + M²*c] = sum_i Ar[a,i] * tmpJ[c + M*b + M²*i]
+    // Stage 3: C[n*LDC + a + M*b + M²*cc] = sum_i Ar[a,i] * tmpJ[(cc^b^i) + M*b + M²*i]
     //   MMA: Ar(8×4) × tmpJ_c^T(4×8) → D(8×8), one per c value (M=8 calls)
+    //   XOR permutation on tmpJ read: physical = (cc ^ b ^ i)
+    //   Original layout had 16-way bank conflicts; XOR reduces to 2-way.
     // ═══════════════════════════════════════════════════════════════════
     #pragma unroll
     for (int cc = 0; cc < M; ++cc) {
-        // B fragment: tmpJ_c transposed → B[i][b] = tmpJ[cc + M*b + M²*i]
+        // B fragment: tmpJ_c transposed → B[i][b] = tmpJ[(cc^b^i) + M*b + M²*i]
         // Thread lane: row = lane%4 = i, col = lane/4 = b
-        const double b_val = tmpJ[cc + M * (lane / 4) + M * M * (lane % 4)];
+        const int b_rd = lane / 4;
+        const int i_rd = lane % 4;
+        const double b_val = tmpJ[(cc ^ b_rd ^ i_rd) + M * b_rd + M * M * i_rd];
 
         double c0 = 0.0, c1 = 0.0;
         double d0, d1;
