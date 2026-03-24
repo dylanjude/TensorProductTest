@@ -175,9 +175,16 @@ int main(int argc, char **argv) {
     cudaMemcpy(d_At, At.data(), K * MPad * sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(d_B,  B.data(),  (size_t)N * LDB * sizeof(double), cudaMemcpyHostToDevice);
 
-    // Warm up
+    // Warm up + error check
     launchFusedTPKernel(d_Ar, d_As, d_At, d_B, d_C_cuda, M, K, N, LDB, LDC);
-    cudaDeviceSynchronize();
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+      printf("CUDA kernel launch failed: %s\n", cudaGetErrorString(err));
+    }
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      printf("CUDA kernel error: %s\n", cudaGetErrorString(err));
+    }
 
 #if TIMER
     Timer stopwatch_cuda;
