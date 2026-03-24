@@ -16,7 +16,7 @@
 #include "TensorProductCUDA_TC.hpp"
 #include <cstdio>
 
-static constexpr int WARPS_PER_BLOCK_TC = 4;
+static constexpr int WARPS_PER_BLOCK_TC = 8;
 
 template <int M, int K>
 __global__ void fused_tp_tc_kernel(
