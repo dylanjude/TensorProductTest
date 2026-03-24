@@ -39,8 +39,8 @@ get_filename_component(DGX3D_OKL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/okl" ABSOLUTE)
 
 # ── Executable ────────────────────────────────────────────────────────
 if(USE_CUDA)
-  add_executable(tensor_product_volume main.cpp Timer.cpp gemm.cpp TensorProductCUDA.cu)
-  set_source_files_properties(TensorProductCUDA.cu PROPERTIES
+  add_executable(tensor_product_volume main.cpp Timer.cpp gemm.cpp TensorProductCUDA.cu TensorProductCUDA_TC.cu)
+  set_source_files_properties(TensorProductCUDA.cu TensorProductCUDA_TC.cu PROPERTIES
     COMPILE_FLAGS "-O3 --use_fast_math"
   )
 else()

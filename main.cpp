@@ -10,6 +10,7 @@
 #include <vector>
 #ifdef DGX3D_HAS_CUDA
 #include "TensorProductCUDA.hpp"
+#include "TensorProductCUDA_TC.hpp"
 #include <cuda_runtime.h>
 #endif
 #define TIMER 1
@@ -202,6 +203,42 @@ int main(int argc, char **argv) {
     cudaMemcpy(C_cuda.data(), d_C_cuda, (size_t)N * LDC * sizeof(double), cudaMemcpyDeviceToHost);
     maxAbsDiff(C_gemm, C_cuda, "gemm", "native CUDA fused");
 
+    ///////////////////////////////////////////////////////////
+    // run Tensor Core fused kernel (FP64 mma.sync m8n8k4)
+    ///////////////////////////////////////////////////////////
+    double *d_C_tc;
+    cudaMalloc(&d_C_tc, (size_t)N * LDC * sizeof(double));
+
+    // Warm up + error check
+    launchFusedTPKernel_TC(d_Ar, d_As, d_At, d_B, d_C_tc, M, K, N, LDB, LDC);
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+      printf("TC kernel launch failed: %s\n", cudaGetErrorString(err));
+    }
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      printf("TC kernel error: %s\n", cudaGetErrorString(err));
+    }
+
+#if TIMER
+    Timer stopwatch_tc;
+    stopwatch_tc.tick();
+    for (int itry = 0; itry < NTRYS; itry++) {
+      launchFusedTPKernel_TC(d_Ar, d_As, d_At, d_B, d_C_tc, M, K, N, LDB, LDC);
+    }
+    cudaDeviceSynchronize();
+    double duration_tc = stopwatch_tc.tock() / NTRYS;
+    double FLOP_tc = (double)N * 2.0 * K * ((double)K*K*M + (double)K*M*M + (double)M*M*M);
+    double TFLOPS_tc = FLOP_tc / duration_tc / 1e12;
+    printf("Tensor Core fused kernel  Compute time = %e TFLOPS=%.2f\n", duration_tc, TFLOPS_tc);
+#endif
+
+    // Copy back and validate
+    std::vector<double> C_tc((size_t)N * LDC, 0.0);
+    cudaMemcpy(C_tc.data(), d_C_tc, (size_t)N * LDC * sizeof(double), cudaMemcpyDeviceToHost);
+    maxAbsDiff(C_gemm, C_tc, "gemm", "Tensor Core fused");
+
+    cudaFree(d_C_tc);
     cudaFree(d_Ar);
     cudaFree(d_As);
     cudaFree(d_At);
