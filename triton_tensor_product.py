@@ -28,10 +28,11 @@ except ImportError:
     HAS_TRITON = False
 
 try:
-    from torch.utils.cpp_extension import load_inline
-    HAS_CUDA_EXT = True
-except ImportError:
-    HAS_CUDA_EXT = False
+    import warp as wp
+    wp.init()
+    HAS_WARP = True
+except (ImportError, Exception):
+    HAS_WARP = False
 
 # ─────────────────────────────────────────────────────────────────────
 # Helpers
@@ -228,177 +229,103 @@ class TritonGraphed:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# CUDA C++ fused kernel — shared memory + __syncthreads__ (mirrors OCCA)
+# NVIDIA Warp — 3-stage sum-factorised tensor product
 # ─────────────────────────────────────────────────────────────────────
-# Compiled via torch.utils.cpp_extension.load_inline (nvcc → cubin).
-# One block per batch element, K*K*M threads per block.
-# Operators and B loaded into shared memory.  Intermediates (tmpK, tmpJ)
-# live entirely in shared memory with __syncthreads() between stages.
+# One Warp thread per (n, output-element) pair in each stage.
+# Uses wp.tile / wp.launch with explicit grid dimensions.
+# Operators are small (M*K) so every thread re-reads them from global
+# memory (L1/L2 cached).  No shared memory — keeps the kernel simple.
 
-_CUDA_KERNEL_SRC = r"""
-#include <torch/extension.h>
-#include <cuda_runtime.h>
+if HAS_WARP:
 
-// Template parameters for compile-time M, K
-template <int M, int K>
-__global__ void fused_tp_kernel(
-    const double* __restrict__ Ar,
-    const double* __restrict__ As,
-    const double* __restrict__ At,
-    const double* __restrict__ B,
-    double* __restrict__ C,
-    int N)
-{
-    const int n = blockIdx.x;
-    if (n >= N) return;
-    const int tid = threadIdx.x;
+    @wp.kernel
+    def _warp_stage1(
+        At: wp.array2d(dtype=wp.float64),   # (M, K)
+        B: wp.array2d(dtype=wp.float64),     # (N, K^3)
+        out: wp.array2d(dtype=wp.float64),   # (N, K*K*M)
+        M_val: int, K_val: int,
+    ):
+        """out[n, i*K*M + j*M + m] = sum_k At[m,k] * B[n, i*K*K + j*K + k]"""
+        tid = wp.tid()
+        KKM = K_val * K_val * M_val
+        n = tid // KKM
+        rem = tid - n * KKM
+        m = rem % M_val
+        tmp = rem // M_val
+        j = tmp % K_val
+        i = tmp // K_val
+        acc = float(0.0)
+        for kk in range(K_val):
+            acc += At[m, kk] * B[n, i * K_val * K_val + j * K_val + kk]
+        out[n, rem] = acc
 
-    constexpr int MK  = M * K;
-    constexpr int K3  = K * K * K;
-    constexpr int S1  = K * K * M;    // stage 1 outputs
-    constexpr int S2  = K * M * M;    // stage 2 outputs
-    constexpr int S3  = M * M * M;    // stage 3 outputs
-    constexpr int TPB = K * K * M;    // threads per block = S1
-    constexpr int NPER_S2 = (S2 + TPB - 1) / TPB;
-    constexpr int NPER_S3 = (S3 + TPB - 1) / TPB;
+    @wp.kernel
+    def _warp_stage2(
+        As: wp.array2d(dtype=wp.float64),   # (M, K)
+        inp: wp.array2d(dtype=wp.float64),  # (N, K*K*M)
+        out: wp.array2d(dtype=wp.float64),  # (N, K*M*M)
+        M_val: int, K_val: int,
+    ):
+        """out[n, i*M*M + b*M + c] = sum_j As[b,j] * inp[n, i*K*M + j*M + c]"""
+        tid = wp.tid()
+        KMM = K_val * M_val * M_val
+        n = tid // KMM
+        rem = tid - n * KMM
+        c = rem % M_val
+        tmp = rem // M_val
+        b = tmp % M_val
+        i = tmp // M_val
+        acc = float(0.0)
+        for jj in range(K_val):
+            acc += As[b, jj] * inp[n, i * K_val * M_val + jj * M_val + c]
+        out[n, rem] = acc
 
-    __shared__ double sAt[MK], sAs[MK], sAr[MK];
-    __shared__ double sB[K3];
-    __shared__ double tmpK[S1];
-    __shared__ double tmpJ[S2];
-
-    // ── Load operators (M*K elements, cooperative) ──────────────
-    if (tid < MK) {
-        sAr[tid] = Ar[tid];
-        sAs[tid] = As[tid];
-        sAt[tid] = At[tid];
-    }
-
-    // ── Load B[n] (K^3 elements) ────────────────────────────────
-    if (tid < K3) {
-        sB[tid] = B[n * K3 + tid];
-    }
-
-    __syncthreads();
-
-    // ── Stage 1: tmpK[i,j,m] = sum_k At[m,k] * B[i,j,k] ──────
-    {
-        const int m  = tid % M;
-        const int j  = (tid / M) % K;
-        const int i  = tid / (M * K);
-        double acc = 0.0;
-        #pragma unroll
-        for (int kk = 0; kk < K; ++kk) {
-            acc += sAt[m * K + kk] * sB[i * K * K + j * K + kk];
-        }
-        tmpK[tid] = acc;  // layout: [i][j][m]
-    }
-
-    __syncthreads();
-
-    // ── Stage 2: tmpJ[i,b,c] = sum_j As[b,j] * tmpK[i,j,c] ───
-    #pragma unroll
-    for (int t = 0; t < NPER_S2; ++t) {
-        const int idx = tid + t * TPB;
-        if (idx < S2) {
-            const int c  = idx % M;
-            const int b  = (idx / M) % M;
-            const int i  = idx / (M * M);
-            double acc = 0.0;
-            #pragma unroll
-            for (int jj = 0; jj < K; ++jj) {
-                acc += sAs[b * K + jj] * tmpK[i * K * M + jj * M + c];
-            }
-            tmpJ[idx] = acc;  // layout: [i][b][c]
-        }
-    }
-
-    __syncthreads();
-
-    // ── Stage 3: C[n,a,b,c] = sum_i Ar[a,i] * tmpJ[i,b,c] ────
-    #pragma unroll
-    for (int t = 0; t < NPER_S3; ++t) {
-        const int idx = tid + t * TPB;
-        if (idx < S3) {
-            const int c = idx % M;
-            const int b = (idx / M) % M;
-            const int a = idx / (M * M);
-            double acc = 0.0;
-            #pragma unroll
-            for (int ii = 0; ii < K; ++ii) {
-                acc += sAr[a * K + ii] * tmpJ[ii * M * M + b * M + c];
-            }
-            C[n * S3 + idx] = acc;
-        }
-    }
-}
-
-// ── Dispatch wrapper (selects template instantiation) ───────────
-torch::Tensor fused_tp_forward(
-    torch::Tensor Ar, torch::Tensor As, torch::Tensor At,
-    torch::Tensor B, int M_val, int K_val)
-{
-    const int N = B.size(0);
-    auto C = torch::empty({N, M_val, M_val, M_val},
-                          B.options().dtype(torch::kFloat64));
-    const int TPB = K_val * K_val * M_val;
-
-    // Template dispatch for common (M, K) pairs
-    #define DISPATCH(MM, KK) \
-        if (M_val == MM && K_val == KK) { \
-            fused_tp_kernel<MM, KK><<<N, TPB>>>( \
-                Ar.data_ptr<double>(), As.data_ptr<double>(), \
-                At.data_ptr<double>(), B.data_ptr<double>(), \
-                C.data_ptr<double>(), N); \
-        }
-
-    DISPATCH(8, 4)
-    else DISPATCH(4, 8)
-    else DISPATCH(6, 3)
-    else DISPATCH(4, 4)
-    else DISPATCH(8, 8)
-    else DISPATCH(16, 8)
-    else DISPATCH(3, 6)
-    else DISPATCH(10, 5)
-    else {
-        TORCH_CHECK(false,
-            "fused_tp_kernel: no template instantiation for M=",
-            M_val, " K=", K_val,
-            ". Add DISPATCH(", M_val, ", ", K_val, ") to the source.");
-    }
-    #undef DISPATCH
-
-    return C;
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &fused_tp_forward, "Fused tensor product (CUDA)");
-}
-"""
-
-_cuda_ext = None
-
-def _get_cuda_ext():
-    """Lazily compile the CUDA extension on first use."""
-    global _cuda_ext
-    if _cuda_ext is None:
-        print("  Compiling CUDA C++ fused kernel (first run only)...")
-        _cuda_ext = load_inline(
-            name='fused_tp',
-            cpp_sources='',
-            cuda_sources=_CUDA_KERNEL_SRC,
-            functions=['forward'],
-            extra_cuda_cflags=['-O3', '--use_fast_math'],
-            verbose=False,
-        )
-    return _cuda_ext
+    @wp.kernel
+    def _warp_stage3(
+        Ar: wp.array2d(dtype=wp.float64),   # (M, K)
+        inp: wp.array2d(dtype=wp.float64),  # (N, K*M*M)
+        out: wp.array2d(dtype=wp.float64),  # (N, M*M*M)
+        M_val: int, K_val: int,
+    ):
+        """out[n, a*M*M + b*M + c] = sum_i Ar[a,i] * inp[n, i*M*M + b*M + c]"""
+        tid = wp.tid()
+        MMM = M_val * M_val * M_val
+        n = tid // MMM
+        rem = tid - n * MMM
+        c = rem % M_val
+        tmp = rem // M_val
+        b = tmp % M_val
+        a = tmp // M_val
+        acc = float(0.0)
+        for ii in range(K_val):
+            acc += Ar[a, ii] * inp[n, ii * M_val * M_val + b * M_val + c]
+        out[n, rem] = acc
 
 
-def cuda_fused_tensor_product(Ar, As, At, B, M, K):
-    """Run the CUDA C++ fused kernel.  All tensors must be contiguous on CUDA."""
-    ext = _get_cuda_ext()
-    return ext.forward(Ar.contiguous(), As.contiguous(),
-                       At.contiguous(), B.contiguous(), M, K)
+def warp_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N):
+    """Run the 3-stage Warp kernel.  All tensors must be on CUDA (torch)."""
+    # Wrap torch tensors as warp arrays (zero-copy via __cuda_array_interface__)
+    At_w = wp.from_torch(At_t.contiguous().reshape(M, K))
+    As_w = wp.from_torch(As_t.contiguous().reshape(M, K))
+    Ar_w = wp.from_torch(Ar_t.contiguous().reshape(M, K))
+    B_w  = wp.from_torch(B_t.contiguous().reshape(N, K * K * K))
+
+    tmp1_t = torch.empty((N, K * K * M), dtype=torch.float64, device='cuda')
+    tmp2_t = torch.empty((N, K * M * M), dtype=torch.float64, device='cuda')
+    C_t    = torch.empty((N, M * M * M), dtype=torch.float64, device='cuda')
+
+    tmp1_w = wp.from_torch(tmp1_t)
+    tmp2_w = wp.from_torch(tmp2_t)
+    C_w    = wp.from_torch(C_t)
+
+    wp.launch(_warp_stage1, dim=N * K * K * M,
+              inputs=[At_w, B_w, tmp1_w, M, K])
+    wp.launch(_warp_stage2, dim=N * K * M * M,
+              inputs=[As_w, tmp1_w, tmp2_w, M, K])
+    wp.launch(_warp_stage3, dim=N * M * M * M,
+              inputs=[Ar_w, tmp2_w, C_w, M, K])
+
+    return C_t.reshape(N, M, M, M)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -497,19 +424,19 @@ def main():
     except Exception as e:
         print(f"  CUDA graph capture failed: {e}")
 
-    # ── CUDA C++ fused kernel (shared mem + syncthreads) ─────────────
-    if not HAS_CUDA_EXT:
-        print("\ntorch.utils.cpp_extension not available — skipping CUDA fused kernel.")
+    # ── NVIDIA Warp 3-stage kernel ───────────────────────────────────
+    if not HAS_WARP:
+        print("\nwarp-lang not installed — skipping Warp benchmarks.")
     else:
-        print("\n--- CUDA C++ fused (shared mem + syncthreads) ---")
+        print("\n--- NVIDIA Warp 3-stage ---")
         try:
-            C_fused = cuda_fused_tensor_product(Ar_t, As_t, At_t, B_t, M, K)
+            C_warp = warp_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
             torch.cuda.synchronize()
-            validate("CUDA fused", C_cpu, C_fused, tol)
-            report_time(bench(cuda_fused_tensor_product, ntrys,
-                              Ar_t, As_t, At_t, B_t, M, K))
+            validate("Warp 3-stage", C_cpu, C_warp, tol)
+            report_time(bench(warp_tensor_product, ntrys,
+                              Ar_t, As_t, At_t, B_t, M, K, N))
         except Exception as e:
-            print(f"  CUDA fused kernel failed: {e}")
+            print(f"  Warp kernel failed: {e}")
 
 
 if __name__ == '__main__':
