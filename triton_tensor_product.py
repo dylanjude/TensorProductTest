@@ -327,109 +327,91 @@ def warp_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# NVIDIA Warp — fused kernel (shared memory, single launch)
+# NVIDIA Warp — tile_matmul fused kernel (M=8, K=4)
 # ─────────────────────────────────────────────────────────────────────
-# Mirrors the OCCA algorithm: one block per batch element, K*K*M threads,
-# operators and intermediates in shared memory, 3 fused stages.
-# Uses wp.launch_tiled for block-level control.  Tile shapes must be
-# compile-time constants, so we hardcode M=8, K=4 here.
+# Expresses each contraction stage as a cooperative tile_matmul, which
+# has proper __syncthreads() internally.  One block per batch element.
 #
-# Synchronization caveat: Warp inserts __syncthreads() implicitly after
-# tile operations (tile_zeros, tile_load) but NOT after manual t[j]=val
-# writes.  We create fresh shared tiles between stages to force barriers.
+# Stage 1: T1[K²,M] = B_reshaped[K²,K] @ At^T[K,M]      (1 matmul)
+# Stage 2: T2_i[M,M] = As[M,K] @ T1_i[K,M] for each i   (K matmuls)
+# Stage 3: C[M,M²]  = Ar[M,K] @ T2_view[K,M²]           (1 matmul)
+#
+# Intermediates go through global memory (L2-cached at these sizes).
+# T2 is passed as two array views of the same memory:
+#   T2_w  [N, K*M, M] = [N, 32, 8]  for Stage 2 writes
+#   T2v_w [N, K, M²]  = [N, 4, 64]  for Stage 3 reads
 
 if HAS_WARP:
 
-    # Compile-time constants for M=8, K=4
-    _FM = wp.constant(8)
-    _FK = wp.constant(4)
-    _FMK = wp.constant(32)     # M*K
-    _FK3 = wp.constant(64)     # K^3
-    _FKKM = wp.constant(128)   # K*K*M = threads per block
-    _FKMM = wp.constant(256)   # K*M*M
-    _FMMM = wp.constant(512)   # M^3
+    # Compile-time tile shape constants for M=8, K=4
+    _TM = wp.constant(8)     # M
+    _TK = wp.constant(4)     # K
+    _TK2 = wp.constant(16)   # K² = 16
+    _TM2 = wp.constant(64)   # M² = 64
 
     @wp.kernel
-    def _warp_fused_84(
-        Ar: wp.array(dtype=wp.float64),    # flat (M*K,)
-        As: wp.array(dtype=wp.float64),
-        At: wp.array(dtype=wp.float64),
-        B: wp.array(dtype=wp.float64),     # flat (N*K^3,)
-        C: wp.array(dtype=wp.float64),     # flat (N*M^3,)
+    def _warp_tiled_84(
+        At_T:  wp.array2d(dtype=wp.float64),   # [K, M]    = [4, 8]  (transposed)
+        As:    wp.array2d(dtype=wp.float64),    # [M, K]    = [8, 4]
+        Ar:    wp.array2d(dtype=wp.float64),    # [M, K]    = [8, 4]
+        B:     wp.array3d(dtype=wp.float64),    # [N, K², K]  = [N, 16, 4]
+        T1:    wp.array3d(dtype=wp.float64),    # [N, K², M]  = [N, 16, 8]
+        T2:    wp.array3d(dtype=wp.float64),    # [N, K*M, M] = [N, 32, 8]
+        T2v:   wp.array3d(dtype=wp.float64),    # [N, K, M²]  = [N, 4, 64]  (same mem as T2)
+        C:     wp.array3d(dtype=wp.float64),    # [N, M, M²]  = [N, 8, 64]
     ):
-        n, tid = wp.tid()
+        n = wp.tid()
 
-        # ── Load operators into shared memory ───────────────────────
-        sAt = wp.tile_zeros(dtype=wp.float64, shape=(_FMK,), storage="shared")
-        sAs = wp.tile_zeros(dtype=wp.float64, shape=(_FMK,), storage="shared")
-        sAr = wp.tile_zeros(dtype=wp.float64, shape=(_FMK,), storage="shared")
-        if tid < _FMK:
-            sAt[tid] = At[tid]
-            sAs[tid] = As[tid]
-            sAr[tid] = Ar[tid]
+        # ── Stage 1: T1[K²,M] = B[K²,K] @ At^T[K,M] ──────────────
+        b_tile  = wp.tile_load(B[n],  shape=(_TK2, _TK))   # [16, 4]
+        at_tile = wp.tile_load(At_T,  shape=(_TK, _TM))    # [4, 8]
+        t1_tile = wp.tile_matmul(b_tile, at_tile)           # [16, 8]
+        wp.tile_store(T1[n], t1_tile)
 
-        # ── Load B[n] into shared memory ────────────────────────────
-        sB = wp.tile_zeros(dtype=wp.float64, shape=(_FK3,), storage="shared")
-        if tid < _FK3:
-            sB[tid] = B[n * _FK3 + tid]
+        # ── Stage 2: T2_i[M,M] = As[M,K] @ T1_i[K,M]  (4 slices) ─
+        as_tile = wp.tile_load(As, shape=(_TM, _TK))       # [8, 4]
+        for i in range(4):
+            t1i = wp.tile_load(T1[n], shape=(_TK, _TM),
+                               offset=(i * _TK, 0))        # [4, 8]
+            t2i = wp.tile_matmul(as_tile, t1i)              # [8, 8]
+            wp.tile_store(T2[n], t2i,
+                          offset=(i * _TM, 0))              # rows [i*8 .. i*8+8]
 
-        # ── Stage 1: tmpK[i,j,m] = sum_k At[m,k] * B[i,j,k] ──────
-        # Creating a new shared tile forces an implicit barrier
-        tmpK = wp.tile_zeros(dtype=wp.float64, shape=(_FKKM,), storage="shared")
-        m1 = tid % _FM
-        j1 = (tid // _FM) % _FK
-        i1 = tid // (_FM * _FK)
-        acc1 = wp.float64(0.0)
-        for kk in range(4):
-            acc1 += sAt[m1 * _FK + kk] * sB[i1 * _FK * _FK + j1 * _FK + kk]
-        tmpK[tid] = acc1
-
-        # ── Stage 2: tmpJ[i,b,c] = sum_j As[b,j] * tmpK[i,j,c] ───
-        tmpJ = wp.tile_zeros(dtype=wp.float64, shape=(_FKMM,), storage="shared")
-        # 256 outputs / 128 threads = 2 passes
-        for t in range(2):
-            idx = tid + t * _FKKM
-            if idx < _FKMM:
-                c2 = idx % _FM
-                tmp2 = idx // _FM
-                b2 = tmp2 % _FM
-                i2 = tmp2 // _FM
-                acc2 = wp.float64(0.0)
-                for jj in range(4):
-                    acc2 += sAs[b2 * _FK + jj] * tmpK[i2 * _FK * _FM + jj * _FM + c2]
-                tmpJ[idx] = acc2
-
-        # ── Stage 3: C[n,a,b,c] = sum_i Ar[a,i] * tmpJ[i,b,c] ────
-        # Force barrier by creating a dummy shared tile
-        _sync = wp.tile_zeros(dtype=wp.float64, shape=(1,), storage="shared")
-        for t in range(4):
-            idx = tid + t * _FKKM
-            if idx < _FMMM:
-                c3 = idx % _FM
-                tmp3 = idx // _FM
-                b3 = tmp3 % _FM
-                a3 = tmp3 // _FM
-                acc3 = wp.float64(0.0)
-                for ii in range(4):
-                    acc3 += sAr[a3 * _FK + ii] * tmpJ[ii * _FM * _FM + b3 * _FM + c3]
-                C[n * _FMMM + idx] = acc3
+        # ── Stage 3: C[M,M²] = Ar[M,K] @ T2v[K,M²] ───────────────
+        ar_tile  = wp.tile_load(Ar,    shape=(_TM, _TK))   # [8, 4]
+        t2v_tile = wp.tile_load(T2v[n], shape=(_TK, _TM2)) # [4, 64]
+        c_tile   = wp.tile_matmul(ar_tile, t2v_tile)        # [8, 64]
+        wp.tile_store(C[n], c_tile)
 
 
 def warp_fused_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N):
-    """Run the fused Warp kernel.  Currently only M=8, K=4."""
+    """Run the tile_matmul fused Warp kernel.  Currently only M=8, K=4."""
     if M != 8 or K != 4:
         raise ValueError(f"Fused Warp kernel only supports M=8, K=4 (got M={M}, K={K})")
 
-    Ar_w = wp.from_torch(Ar_t.contiguous().reshape(-1))
-    As_w = wp.from_torch(As_t.contiguous().reshape(-1))
-    At_w = wp.from_torch(At_t.contiguous().reshape(-1))
-    B_w  = wp.from_torch(B_t.contiguous().reshape(-1))
-    C_t  = torch.empty(N * M * M * M, dtype=torch.float64, device='cuda')
-    C_w  = wp.from_torch(C_t)
+    # Pre-transpose At for Stage 1: need [K, M] = [4, 8]
+    At_T_t = At_t.t().contiguous()
 
-    wp.launch_tiled(_warp_fused_84, dim=[N],
-                    inputs=[Ar_w, As_w, At_w, B_w, C_w],
-                    block_dim=128)
+    At_T_w = wp.from_torch(At_T_t)                                      # [4, 8]
+    As_w   = wp.from_torch(As_t.contiguous())                            # [8, 4]
+    Ar_w   = wp.from_torch(Ar_t.contiguous())                            # [8, 4]
+    B_w    = wp.from_torch(B_t.contiguous().reshape(N, K*K, K))          # [N, 16, 4]
+
+    T1_t = torch.empty((N, K*K, M), dtype=torch.float64, device='cuda') # [N, 16, 8]
+    T2_t = torch.empty((N, K*M, M), dtype=torch.float64, device='cuda') # [N, 32, 8]
+    C_t  = torch.empty((N, M, M*M), dtype=torch.float64, device='cuda') # [N, 8, 64]
+
+    # T2 viewed as [N, K, M²] for Stage 3 — same memory, different shape
+    T2v_t = T2_t.reshape(N, K, M*M)
+
+    T1_w  = wp.from_torch(T1_t)
+    T2_w  = wp.from_torch(T2_t)
+    T2v_w = wp.from_torch(T2v_t)
+    C_w   = wp.from_torch(C_t)
+
+    wp.launch_tiled(_warp_tiled_84, dim=[N],
+                    inputs=[At_T_w, As_w, Ar_w, B_w, T1_w, T2_w, T2v_w, C_w],
+                    block_dim=64)
 
     return C_t.reshape(N, M, M, M)
 
@@ -544,17 +526,17 @@ def main():
         except Exception as e:
             print(f"  Warp kernel failed: {e}")
 
-        # ── NVIDIA Warp fused kernel (shared mem, M=8 K=4 only) ──────
+        # ── NVIDIA Warp tile_matmul fused kernel (M=8 K=4 only) ───────
         if M == 8 and K == 4:
-            print("\n--- NVIDIA Warp fused (shared mem) ---")
+            print("\n--- NVIDIA Warp tile_matmul fused ---")
             try:
                 C_wfused = warp_fused_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
                 torch.cuda.synchronize()
-                validate("Warp fused", C_cpu, C_wfused, tol)
+                validate("Warp tile_matmul", C_cpu, C_wfused, tol)
                 report_time(bench(warp_fused_tensor_product, ntrys,
                                   Ar_t, As_t, At_t, B_t, M, K, N))
             except Exception as e:
-                print(f"  Warp fused kernel failed: {e}")
+                print(f"  Warp tile_matmul kernel failed: {e}")
 
 
 if __name__ == '__main__':
