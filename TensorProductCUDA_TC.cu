@@ -1,22 +1,25 @@
 // =====================================================================
-// FP64 Tensor Core fused tensor-product kernel
+// FP64 Tensor Core fused tensor-product kernel (general M <= 8, K <= 8)
 // C[n, a, b, c] = sum_i Ar[a,i] * sum_j As[b,j] * sum_k At[c,k] * B[n,i,j,k]
 //
 // Uses mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 PTX instruction.
 // Requires SM >= 8.0 (Ampere / Hopper).
 //
 // One warp (32 threads) per batch element n.
-// Operators pre-loaded into registers; B and intermediates in shared memory.
+// Operators padded to MPAD=8 rows and loaded into registers.
+// For K > 4, contractions are split into ceil(K/4) MMA chunks with
+// accumulation.  Intermediates reside in per-warp shared memory.
+// sB (stage 1) and tmpJ (stages 2-3) share the same memory since
+// their lifetimes do not overlap.
+//
 // Three sum-factorized stages, each using MMA instructions:
-//   Stage 1: T1[m,j,i]   = sum_k At[m,k] * B[i,j,k]       — 2 MMA ops
-//   Stage 2: T2[b,c,i]   = sum_j As[b,j] * T1[c,j,i]      — K MMA ops
-//   Stage 3: C[a,b,c]    = sum_i Ar[a,i] * T2[b,c,i]       — M MMA ops
+//   Stage 1: T1[m,j,i]   = sum_k At[m,k] * B[i,j,k]
+//   Stage 2: T2[b,c,i]   = sum_j As[b,j] * T1[c,j,i]
+//   Stage 3: C[a,b,c]    = sum_i Ar[a,i] * T2[b,c,i]
 //
 // Bank-conflict reduction via XOR permutation (Cui 2024, Fig. 4):
-//   tmpK stored at (m ^ j)  + M*j + M*K*i   instead of m + M*j + M*K*i
-//   tmpJ stored at (c ^ b ^ i) + M*b + M*M*i instead of c + M*b + M*M*i
-// This reduces stage 3 shared-memory bank conflicts from 16-way to 2-way
-// (2-way is the theoretical minimum for 32 threads accessing M=8 doubles).
+//   tmpK stored at (m ^ j)      + MPAD*j + MPAD*K*i
+//   tmpJ stored at (c ^ b ^ i)  + MPAD*b + MPAD*MPAD*i
 // =====================================================================
 
 #include "TensorProductCUDA_TC.hpp"
@@ -33,47 +36,52 @@ __global__ void fused_tp_tc_kernel(
     double* __restrict__ C,
     int N, int LDB, int LDC)
 {
-    static_assert(M == 8, "TC kernel currently requires M=8");
-    static_assert(K == 4, "TC kernel currently requires K=4");
+    static_assert(M >= 1 && M <= 8, "TC kernel requires 1 <= M <= 8");
+    static_assert(K >= 1 && K <= 8, "TC kernel requires 1 <= K <= 8");
 
-    constexpr int MK  = M * K;         // 32
-    constexpr int K3  = K * K * K;     // 64
-    constexpr int KKM = K * K * M;     // 128 (tmpK size)
-    constexpr int KMM = K * M * M;     // 256 (tmpJ size)
-    constexpr int NUM_BATCHES_S1 = (K * K + 7) / 8;  // 2
+    constexpr int MPAD      = 8;                          // MMA row dimension
+    constexpr int K_CHUNKS   = (K + 3) / 4;               // ceil(K/4)
+    constexpr int MK         = M * K;                      // operator elements
+    constexpr int K3         = K * K * K;                  // B slice size
+    constexpr int KKM        = MPAD * K * K;               // tmpK size
+    constexpr int KMM        = MPAD * MPAD * K;            // tmpJ size
+    constexpr int SB_TMPJ    = (K3 > KMM) ? K3 : KMM;     // shared region for sB/tmpJ overlay
+    constexpr int WS_PER_WARP = SB_TMPJ + KKM;             // total per-warp workspace
+    constexpr int NUM_BATCHES_S1 = (K * K + 7) / 8;        // stage 1 batches
 
     const int warpId = threadIdx.x / 32;
     const int lane   = threadIdx.x % 32;
     const int n      = blockIdx.x * WARPS_PER_BLOCK_TC + warpId;
 
     // ── Shared memory layout ───────────────────────────────────────────
-    // Operators: shared across all warps (3 * MK = 96 doubles)
-    __shared__ double sOps[3 * MK];
+    // Operators: MPAD-strided, zero-padded for m >= M (3 * MPAD * K)
+    __shared__ double sOps[3 * MPAD * K];
     double* sAt = sOps;
-    double* sAs = sOps + MK;
-    double* sAr = sOps + 2 * MK;
+    double* sAs = sOps + MPAD * K;
+    double* sAr = sOps + 2 * MPAD * K;
 
-    // Per-warp workspace: sB[K³] + tmpK[K²M] + tmpJ[KM²]
-    __shared__ double ws[WARPS_PER_BLOCK_TC][K3 + KKM + KMM];
-    double* sB   = ws[warpId];
-    double* tmpK = ws[warpId] + K3;
-    double* tmpJ = ws[warpId] + K3 + KKM;
+    // Per-warp workspace: sB/tmpJ overlay + tmpK
+    __shared__ double ws[WARPS_PER_BLOCK_TC][WS_PER_WARP];
+    double* sB   = ws[warpId];              // valid during stage 1
+    double* tmpJ = ws[warpId];              // valid during stages 2-3 (same memory as sB)
+    double* tmpK = ws[warpId] + SB_TMPJ;    // valid during stages 1-2
 
-    // ── Load operators cooperatively (ALL warps participate) ───────────
+    // ── Load operators into MPAD-strided shared memory ─────────────────
+    // Store as sOp[k * MPAD + m], zero-padding rows m >= M
     {
         const int tid   = threadIdx.x;
         const int total = WARPS_PER_BLOCK_TC * 32;
-        for (int i = tid; i < 3 * MK; i += total) {
-            if (i < MK)
-                sOps[i] = At[i];
-            else if (i < 2 * MK)
-                sOps[i] = As[i - MK];
-            else
-                sOps[i] = Ar[i - 2 * MK];
+        for (int idx = tid; idx < 3 * MPAD * K; idx += total) {
+            const int op  = idx / (MPAD * K);   // 0=At, 1=As, 2=Ar
+            const int rem = idx % (MPAD * K);
+            const int k   = rem / MPAD;
+            const int m   = rem % MPAD;
+            const double* src = (op == 0) ? At : (op == 1) ? As : Ar;
+            sOps[idx] = (m < M && k < K) ? src[k * M + m] : 0.0;
         }
     }
 
-    // Load B slice into per-warp shared memory (before syncthreads)
+    // Load B slice into per-warp shared memory
     if (n < N) {
         for (int t = lane; t < K3; t += 32) {
             sB[t] = B[(size_t)n * LDB + t];
@@ -84,118 +92,136 @@ __global__ void fused_tp_tc_kernel(
 
     if (n >= N) return;  // early exit AFTER syncthreads
 
-    // ── Pre-load operator A-fragments into registers ───────────────────
+    // ── Pre-load operator A-fragments for each K-chunk ─────────────────
     // MMA A is row-major 8×4: thread lane holds A[lane/4][lane%4]
-    // Operators stored column-major: Op(m,k) = Op[k*M + m]
-    // A[lane/4][lane%4] = Op[m=lane/4, k=lane%4] = Op[(lane%4)*M + lane/4]
-    const double a_At = sAt[(lane % 4) * M + (lane / 4)];
-    const double a_As = sAs[(lane % 4) * M + (lane / 4)];
-    const double a_Ar = sAr[(lane % 4) * M + (lane / 4)];
+    // Shared operators stored as Op[k * MPAD + m]
+    double a_At[K_CHUNKS], a_As[K_CHUNKS], a_Ar[K_CHUNKS];
+    #pragma unroll
+    for (int kc = 0; kc < K_CHUNKS; ++kc) {
+        const int k_col = kc * 4 + (lane % 4);
+        a_At[kc] = (k_col < K) ? sAt[k_col * MPAD + (lane / 4)] : 0.0;
+        a_As[kc] = (k_col < K) ? sAs[k_col * MPAD + (lane / 4)] : 0.0;
+        a_Ar[kc] = (k_col < K) ? sAr[k_col * MPAD + (lane / 4)] : 0.0;
+    }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Stage 1: tmpK[(m^j) + M*j + M*K*i] = sum_k At[m,k] * B[i + K*j + K²*k]
-    //   MMA: At(8×4) × B_batch(4×8) → D(8×8), 2 batches of 8 (i,j) pairs
-    //   XOR permutation on first index: physical = (m ^ j)
+    // Stage 1: tmpK[(m^j) + MPAD*j + MPAD*K*i] = sum_k At[m,k] * B[i+K*j+K²*k]
+    //   Batches K² output (i,j) pairs into groups of 8.
+    //   Accumulates across ceil(K/4) MMA chunks for the k contraction.
     // ═══════════════════════════════════════════════════════════════════
     #pragma unroll
     for (int batch = 0; batch < NUM_BATCHES_S1; ++batch) {
-        // B fragment: col-major 4×8, B_packed[k][n_col] = B[i + K*j + K²*k]
-        // Thread lane: row = lane%4 = k, col = lane/4 = n_col
-        const int n_col = lane / 4;          // 0..7
-        const int k_idx = lane % 4;          // 0..3
-        const int i_idx = 2 * batch + n_col / K;
-        const int j_idx = n_col % K;
-        const double b_val = sB[i_idx + K * j_idx + K * K * k_idx];
+        double d0 = 0.0, d1 = 0.0;
 
-        double c0 = 0.0, c1 = 0.0;
-        double d0, d1;
+        #pragma unroll
+        for (int kc = 0; kc < K_CHUNKS; ++kc) {
+            const int n_col    = lane / 4;
+            const int k_local  = lane % 4;
+            const int k_global = kc * 4 + k_local;
+            const int linear   = 8 * batch + n_col;
+            const int i_idx    = linear / K;
+            const int j_idx    = linear % K;
 
-        asm volatile(
-            "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 "
-            "{%0, %1}, {%2}, {%3}, {%4, %5};"
-            : "=d"(d0), "=d"(d1)
-            : "d"(a_At), "d"(b_val), "d"(c0), "d"(c1)
-        );
+            const double b_val = (linear < K * K && k_global < K)
+                ? sB[i_idx + K * j_idx + K * K * k_global] : 0.0;
 
-        // Result D[m][n]: m = lane/4, col0 = (lane%4)*2, col1 = col0+1
+            asm volatile(
+                "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 "
+                "{%0, %1}, {%2}, {%3}, {%4, %5};"
+                : "=d"(d0), "=d"(d1)
+                : "d"(a_At[kc]), "d"(b_val), "d"(d0), "d"(d1)
+            );
+        }
+
+        // Store results — guard against out-of-range (i,j) pairs
         const int m    = lane / 4;
         const int col0 = (lane % 4) * 2;
         const int col1 = col0 + 1;
-        // Map output column back to (i, j)
-        const int i0 = 2 * batch + col0 / K, j0 = col0 % K;
-        const int i1 = 2 * batch + col1 / K, j1 = col1 % K;
-        // XOR permutation: store at (m ^ j) instead of m
-        tmpK[(m ^ j0) + M * j0 + M * K * i0] = d0;
-        tmpK[(m ^ j1) + M * j1 + M * K * i1] = d1;
+        const int lin0 = 8 * batch + col0;
+        const int lin1 = 8 * batch + col1;
+
+        if (lin0 < K * K) {
+            const int i0 = lin0 / K, j0 = lin0 % K;
+            tmpK[(m ^ j0) + MPAD * j0 + MPAD * K * i0] = d0;
+        }
+        if (lin1 < K * K) {
+            const int i1 = lin1 / K, j1 = lin1 % K;
+            tmpK[(m ^ j1) + MPAD * j1 + MPAD * K * i1] = d1;
+        }
     }
 
     __syncwarp();
 
     // ═══════════════════════════════════════════════════════════════════
-    // Stage 2: tmpJ[(c^b^ii) + M*b + M²*ii] = sum_j As[b,j] * tmpK[(c^j) + M*j + M*K*ii]
-    //   MMA: As(8×4) × tmpK_i^T(4×8) → D(8×8), one per i value (K=4 calls)
-    //   XOR permutation on tmpK read: physical = (c ^ j)
-    //   XOR permutation on tmpJ write: physical = (c ^ b ^ ii)
+    // Stage 2: tmpJ[(c^b^ii) + MPAD*b + MPAD²*ii]
+    //        = sum_j As[b,j] * tmpK[(c^j) + MPAD*j + MPAD*K*ii]
+    //   One MMA per (ii, K-chunk) pair.  Accumulates across K-chunks.
     // ═══════════════════════════════════════════════════════════════════
     #pragma unroll
     for (int ii = 0; ii < K; ++ii) {
-        // B fragment: tmpK_i transposed → B[j][c] = tmpK[(c^j) + M*j + M*K*ii]
-        // Thread lane: row = lane%4 = j, col = lane/4 = c
-        const int c_rd = lane / 4;
-        const int j_rd = lane % 4;
-        const double b_val = tmpK[(c_rd ^ j_rd) + M * j_rd + M * K * ii];
+        double d0 = 0.0, d1 = 0.0;
 
-        double c0 = 0.0, c1 = 0.0;
-        double d0, d1;
+        #pragma unroll
+        for (int kc = 0; kc < K_CHUNKS; ++kc) {
+            const int c_rd     = lane / 4;
+            const int j_local  = lane % 4;
+            const int j_actual = kc * 4 + j_local;
 
-        asm volatile(
-            "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 "
-            "{%0, %1}, {%2}, {%3}, {%4, %5};"
-            : "=d"(d0), "=d"(d1)
-            : "d"(a_As), "d"(b_val), "d"(c0), "d"(c1)
-        );
+            const double b_val = (j_actual < K)
+                ? tmpK[(c_rd ^ j_actual) + MPAD * j_actual + MPAD * K * ii] : 0.0;
 
-        // D[b][c]: b = lane/4, c0 = (lane%4)*2, c1 = (lane%4)*2+1
+            asm volatile(
+                "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 "
+                "{%0, %1}, {%2}, {%3}, {%4, %5};"
+                : "=d"(d0), "=d"(d1)
+                : "d"(a_As[kc]), "d"(b_val), "d"(d0), "d"(d1)
+            );
+        }
+
         const int b_idx  = lane / 4;
         const int c0_idx = (lane % 4) * 2;
         const int c1_idx = c0_idx + 1;
-        // XOR permutation: store at (c ^ b ^ ii) instead of c
-        tmpJ[(c0_idx ^ b_idx ^ ii) + M * b_idx + M * M * ii] = d0;
-        tmpJ[(c1_idx ^ b_idx ^ ii) + M * b_idx + M * M * ii] = d1;
+        tmpJ[(c0_idx ^ b_idx ^ ii) + MPAD * b_idx + MPAD * MPAD * ii] = d0;
+        tmpJ[(c1_idx ^ b_idx ^ ii) + MPAD * b_idx + MPAD * MPAD * ii] = d1;
     }
 
     __syncwarp();
 
     // ═══════════════════════════════════════════════════════════════════
-    // Stage 3: C[n*LDC + a + M*b + M²*cc] = sum_i Ar[a,i] * tmpJ[(cc^b^i) + M*b + M²*i]
-    //   MMA: Ar(8×4) × tmpJ_c^T(4×8) → D(8×8), one per c value (M=8 calls)
-    //   XOR permutation on tmpJ read: physical = (cc ^ b ^ i)
-    //   Original layout had 16-way bank conflicts; XOR reduces to 2-way.
+    // Stage 3: C[n*LDC + a + M*b + M²*cc]
+    //        = sum_i Ar[a,i] * tmpJ[(cc^b^i) + MPAD*b + MPAD²*i]
+    //   One MMA per (cc, K-chunk) pair.  Accumulates across K-chunks.
+    //   Bounds-check C writes for M < 8.
     // ═══════════════════════════════════════════════════════════════════
     #pragma unroll
     for (int cc = 0; cc < M; ++cc) {
-        // B fragment: tmpJ_c transposed → B[i][b] = tmpJ[(cc^b^i) + M*b + M²*i]
-        // Thread lane: row = lane%4 = i, col = lane/4 = b
-        const int b_rd = lane / 4;
-        const int i_rd = lane % 4;
-        const double b_val = tmpJ[(cc ^ b_rd ^ i_rd) + M * b_rd + M * M * i_rd];
+        double d0 = 0.0, d1 = 0.0;
 
-        double c0 = 0.0, c1 = 0.0;
-        double d0, d1;
+        #pragma unroll
+        for (int kc = 0; kc < K_CHUNKS; ++kc) {
+            const int b_rd     = lane / 4;
+            const int i_local  = lane % 4;
+            const int i_actual = kc * 4 + i_local;
 
-        asm volatile(
-            "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 "
-            "{%0, %1}, {%2}, {%3}, {%4, %5};"
-            : "=d"(d0), "=d"(d1)
-            : "d"(a_Ar), "d"(b_val), "d"(c0), "d"(c1)
-        );
+            const double b_val = (i_actual < K)
+                ? tmpJ[(cc ^ b_rd ^ i_actual) + MPAD * b_rd + MPAD * MPAD * i_actual] : 0.0;
 
-        // D[a][b]: a = lane/4, b0 = (lane%4)*2, b1 = (lane%4)*2+1
+            asm volatile(
+                "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 "
+                "{%0, %1}, {%2}, {%3}, {%4, %5};"
+                : "=d"(d0), "=d"(d1)
+                : "d"(a_Ar[kc]), "d"(b_val), "d"(d0), "d"(d1)
+            );
+        }
+
         const int a_idx  = lane / 4;
         const int b0_idx = (lane % 4) * 2;
         const int b1_idx = b0_idx + 1;
-        C[(size_t)n * LDC + a_idx + M * b0_idx + M * M * cc] = d0;
-        C[(size_t)n * LDC + a_idx + M * b1_idx + M * M * cc] = d1;
+
+        if (a_idx < M && b0_idx < M)
+            C[(size_t)n * LDC + a_idx + M * b0_idx + M * M * cc] = d0;
+        if (a_idx < M && b1_idx < M)
+            C[(size_t)n * LDC + a_idx + M * b1_idx + M * M * cc] = d1;
     }
 }
 
@@ -206,17 +232,31 @@ void launchFusedTPKernel_TC(
     const double* d_B, double* d_C,
     int M, int K, int N, int LDB, int LDC)
 {
-    if (M == 8 && K == 4) {
-        constexpr int WPB = WARPS_PER_BLOCK_TC;
-        const int blocks  = (N + WPB - 1) / WPB;
-        const int threads = WPB * 32;
-        fused_tp_tc_kernel<8, 4><<<blocks, threads>>>(
-            d_Ar, d_As, d_At, d_B, d_C, N, LDB, LDC);
-        return;
+    constexpr int WPB = WARPS_PER_BLOCK_TC;
+
+    #define DISPATCH_TC(MM, KK) \
+        if (M == MM && K == KK) { \
+            const int blocks  = (N + WPB - 1) / WPB; \
+            const int threads = WPB * 32; \
+            fused_tp_tc_kernel<MM, KK><<<blocks, threads>>>( \
+                d_Ar, d_As, d_At, d_B, d_C, N, LDB, LDC); \
+            return; \
+        }
+
+    DISPATCH_TC(8, 4)
+    else DISPATCH_TC(4, 8)
+    else DISPATCH_TC(5, 3)
+    else DISPATCH_TC(3, 5)
+    else DISPATCH_TC(4, 4)
+    else DISPATCH_TC(6, 3)
+    else DISPATCH_TC(3, 6)
+    else DISPATCH_TC(8, 8)
+    else {
+        fprintf(stderr,
+            "ERROR: fused_tp_tc_kernel has no instantiation for M=%d, K=%d\n"
+            "Add DISPATCH_TC(%d, %d) to TensorProductCUDA_TC.cu\n",
+            M, K, M, K);
     }
 
-    fprintf(stderr,
-        "ERROR: fused_tp_tc_kernel has no instantiation for M=%d, K=%d\n"
-        "Currently only M=8, K=4 is supported for Tensor Core path.\n",
-        M, K);
+    #undef DISPATCH_TC
 }
