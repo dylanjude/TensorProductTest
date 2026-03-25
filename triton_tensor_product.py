@@ -254,7 +254,7 @@ if HAS_WARP:
         tmp = rem // M_val
         j = tmp % K_val
         i = tmp // K_val
-        acc = float(0.0)
+        acc = wp.float64(0.0)
         for kk in range(K_val):
             acc += At[m, kk] * B[n, i * K_val * K_val + j * K_val + kk]
         out[n, rem] = acc
@@ -275,7 +275,7 @@ if HAS_WARP:
         tmp = rem // M_val
         b = tmp % M_val
         i = tmp // M_val
-        acc = float(0.0)
+        acc = wp.float64(0.0)
         for jj in range(K_val):
             acc += As[b, jj] * inp[n, i * K_val * M_val + jj * M_val + c]
         out[n, rem] = acc
@@ -296,7 +296,7 @@ if HAS_WARP:
         tmp = rem // M_val
         b = tmp % M_val
         a = tmp // M_val
-        acc = float(0.0)
+        acc = wp.float64(0.0)
         for ii in range(K_val):
             acc += Ar[a, ii] * inp[n, ii * M_val * M_val + b * M_val + c]
         out[n, rem] = acc
