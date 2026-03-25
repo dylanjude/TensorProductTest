@@ -229,12 +229,11 @@ class TritonGraphed:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# NVIDIA Warp — 3-stage sum-factorised tensor product
+# NVIDIA Warp — 3-stage sum-factorised tensor product (simple)
 # ─────────────────────────────────────────────────────────────────────
 # One Warp thread per (n, output-element) pair in each stage.
-# Uses wp.tile / wp.launch with explicit grid dimensions.
-# Operators are small (M*K) so every thread re-reads them from global
-# memory (L1/L2 cached).  No shared memory — keeps the kernel simple.
+# No shared memory — every thread reads operators from global memory
+# (L1/L2 cached).  Three separate kernel launches.
 
 if HAS_WARP:
 
@@ -304,7 +303,6 @@ if HAS_WARP:
 
 def warp_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N):
     """Run the 3-stage Warp kernel.  All tensors must be on CUDA (torch)."""
-    # Wrap torch tensors as warp arrays (zero-copy via __cuda_array_interface__)
     At_w = wp.from_torch(At_t.contiguous().reshape(M, K))
     As_w = wp.from_torch(As_t.contiguous().reshape(M, K))
     Ar_w = wp.from_torch(Ar_t.contiguous().reshape(M, K))
@@ -324,6 +322,114 @@ def warp_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N):
               inputs=[As_w, tmp1_w, tmp2_w, M, K])
     wp.launch(_warp_stage3, dim=N * M * M * M,
               inputs=[Ar_w, tmp2_w, C_w, M, K])
+
+    return C_t.reshape(N, M, M, M)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# NVIDIA Warp — fused kernel (shared memory, single launch)
+# ─────────────────────────────────────────────────────────────────────
+# Mirrors the OCCA algorithm: one block per batch element, K*K*M threads,
+# operators and intermediates in shared memory, 3 fused stages.
+# Uses wp.launch_tiled for block-level control.  Tile shapes must be
+# compile-time constants, so we hardcode M=8, K=4 here.
+#
+# Synchronization caveat: Warp inserts __syncthreads() implicitly after
+# tile operations (tile_zeros, tile_load) but NOT after manual t[j]=val
+# writes.  We create fresh shared tiles between stages to force barriers.
+
+if HAS_WARP:
+
+    # Compile-time constants for M=8, K=4
+    _FM = wp.constant(8)
+    _FK = wp.constant(4)
+    _FMK = wp.constant(32)     # M*K
+    _FK3 = wp.constant(64)     # K^3
+    _FKKM = wp.constant(128)   # K*K*M = threads per block
+    _FKMM = wp.constant(256)   # K*M*M
+    _FMMM = wp.constant(512)   # M^3
+
+    @wp.kernel
+    def _warp_fused_84(
+        Ar: wp.array(dtype=wp.float64),    # flat (M*K,)
+        As: wp.array(dtype=wp.float64),
+        At: wp.array(dtype=wp.float64),
+        B: wp.array(dtype=wp.float64),     # flat (N*K^3,)
+        C: wp.array(dtype=wp.float64),     # flat (N*M^3,)
+    ):
+        n, tid = wp.tid()
+
+        # ── Load operators into shared memory ───────────────────────
+        sAt = wp.tile_zeros(dtype=wp.float64, shape=(_FMK,), storage="shared")
+        sAs = wp.tile_zeros(dtype=wp.float64, shape=(_FMK,), storage="shared")
+        sAr = wp.tile_zeros(dtype=wp.float64, shape=(_FMK,), storage="shared")
+        if tid < _FMK:
+            sAt[tid] = At[tid]
+            sAs[tid] = As[tid]
+            sAr[tid] = Ar[tid]
+
+        # ── Load B[n] into shared memory ────────────────────────────
+        sB = wp.tile_zeros(dtype=wp.float64, shape=(_FK3,), storage="shared")
+        if tid < _FK3:
+            sB[tid] = B[n * _FK3 + tid]
+
+        # ── Stage 1: tmpK[i,j,m] = sum_k At[m,k] * B[i,j,k] ──────
+        # Creating a new shared tile forces an implicit barrier
+        tmpK = wp.tile_zeros(dtype=wp.float64, shape=(_FKKM,), storage="shared")
+        m1 = tid % _FM
+        j1 = (tid // _FM) % _FK
+        i1 = tid // (_FM * _FK)
+        acc1 = wp.float64(0.0)
+        for kk in range(4):
+            acc1 += sAt[m1 * _FK + kk] * sB[i1 * _FK * _FK + j1 * _FK + kk]
+        tmpK[tid] = acc1
+
+        # ── Stage 2: tmpJ[i,b,c] = sum_j As[b,j] * tmpK[i,j,c] ───
+        tmpJ = wp.tile_zeros(dtype=wp.float64, shape=(_FKMM,), storage="shared")
+        # 256 outputs / 128 threads = 2 passes
+        for t in range(2):
+            idx = tid + t * _FKKM
+            if idx < _FKMM:
+                c2 = idx % _FM
+                tmp2 = idx // _FM
+                b2 = tmp2 % _FM
+                i2 = tmp2 // _FM
+                acc2 = wp.float64(0.0)
+                for jj in range(4):
+                    acc2 += sAs[b2 * _FK + jj] * tmpK[i2 * _FK * _FM + jj * _FM + c2]
+                tmpJ[idx] = acc2
+
+        # ── Stage 3: C[n,a,b,c] = sum_i Ar[a,i] * tmpJ[i,b,c] ────
+        # Force barrier by creating a dummy shared tile
+        _sync = wp.tile_zeros(dtype=wp.float64, shape=(1,), storage="shared")
+        for t in range(4):
+            idx = tid + t * _FKKM
+            if idx < _FMMM:
+                c3 = idx % _FM
+                tmp3 = idx // _FM
+                b3 = tmp3 % _FM
+                a3 = tmp3 // _FM
+                acc3 = wp.float64(0.0)
+                for ii in range(4):
+                    acc3 += sAr[a3 * _FK + ii] * tmpJ[ii * _FM * _FM + b3 * _FM + c3]
+                C[n * _FMMM + idx] = acc3
+
+
+def warp_fused_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N):
+    """Run the fused Warp kernel.  Currently only M=8, K=4."""
+    if M != 8 or K != 4:
+        raise ValueError(f"Fused Warp kernel only supports M=8, K=4 (got M={M}, K={K})")
+
+    Ar_w = wp.from_torch(Ar_t.contiguous().reshape(-1))
+    As_w = wp.from_torch(As_t.contiguous().reshape(-1))
+    At_w = wp.from_torch(At_t.contiguous().reshape(-1))
+    B_w  = wp.from_torch(B_t.contiguous().reshape(-1))
+    C_t  = torch.empty(N * M * M * M, dtype=torch.float64, device='cuda')
+    C_w  = wp.from_torch(C_t)
+
+    wp.launch_tiled(_warp_fused_84, dim=[N],
+                    inputs=[Ar_w, As_w, At_w, B_w, C_w],
+                    block_dim=128)
 
     return C_t.reshape(N, M, M, M)
 
@@ -437,6 +543,18 @@ def main():
                               Ar_t, As_t, At_t, B_t, M, K, N))
         except Exception as e:
             print(f"  Warp kernel failed: {e}")
+
+        # ── NVIDIA Warp fused kernel (shared mem, M=8 K=4 only) ──────
+        if M == 8 and K == 4:
+            print("\n--- NVIDIA Warp fused (shared mem) ---")
+            try:
+                C_wfused = warp_fused_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
+                torch.cuda.synchronize()
+                validate("Warp fused", C_cpu, C_wfused, tol)
+                report_time(bench(warp_fused_tensor_product, ntrys,
+                                  Ar_t, As_t, At_t, B_t, M, K, N))
+            except Exception as e:
+                print(f"  Warp fused kernel failed: {e}")
 
 
 if __name__ == '__main__':
