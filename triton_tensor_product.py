@@ -337,60 +337,66 @@ def triton_fused_tensor_product(Ar, As, At, B, M, K, N):
 if HAS_TRITON:
 
     @triton.jit
-    def _fused_dot_kernel(
-        W_ptr, At_ptr, B_ptr, C_ptr,
+    def _fused_kron_kernel(
+        W_ptr, At_ptr, B_ptr, C_ptr, scratch_ptr,
         N: tl.constexpr, M: tl.constexpr, K: tl.constexpr,
-        K_PAD: tl.constexpr, M_PAD: tl.constexpr,
+        BLOCK: tl.constexpr,
     ):
         n = tl.program_id(0)
+        offs = tl.arange(0, BLOCK)
+
         KK: tl.constexpr = K * K
+        KKM: tl.constexpr = KK * M
         K3: tl.constexpr = KK * K
         MM: tl.constexpr = M * M
         MMM: tl.constexpr = MM * M
 
-        # Load B[n] as [K², K_PAD] — zero-padded from [K², K]
-        row_b = tl.arange(0, KK)
-        col_b = tl.arange(0, K_PAD)
-        b_mask = col_b[None, :] < K
-        B_block = tl.load(B_ptr + n * K3 + row_b[:, None] * K
-                          + tl.minimum(col_b[None, :], K - 1),
-                          mask=b_mask, other=0.0)
+        tmpK_ptr = scratch_ptr + n * KKM
 
-        # Load At^T as [K_PAD, M_PAD] — zero-padded from [K, M]
-        row_at = tl.arange(0, K_PAD)
-        col_at = tl.arange(0, M_PAD)
-        at_mask = (row_at[:, None] < K) & (col_at[None, :] < M)
-        AtT_block = tl.load(At_ptr + tl.minimum(col_at[None, :], M - 1) * K
-                            + tl.minimum(row_at[:, None], K - 1),
-                            mask=at_mask, other=0.0)
+        # ── Stage 1: tmpK[i*K+j, m] = sum_k At[m,k] * B[n,i,j,k] ───
+        mask1 = offs < KKM
+        m1 = offs % M
+        tmp1 = offs // M
+        j1 = tmp1 % K
+        i1 = tmp1 // K
+        acc1 = tl.zeros([BLOCK], dtype=tl.float64)
+        for kk in tl.static_range(K):
+            at_val = tl.load(At_ptr + m1 * K + kk, mask=mask1)
+            b_val  = tl.load(B_ptr + n * K3 + i1 * K * K + j1 * K + kk,
+                             mask=mask1)
+            acc1 += at_val * b_val
+        tl.store(tmpK_ptr + offs, acc1, mask=mask1)
+        tl.debug_barrier()
 
-        # Stage 1: T1[K², M_PAD] = B[K², K_PAD] @ At^T[K_PAD, M_PAD]
-        T1 = tl.dot(B_block, AtT_block)
-
-        # Load W = kron(Ar, As) as [M², K²]  (KK=16 already meets min)
-        row_w = tl.arange(0, MM)
-        col_w = tl.arange(0, KK)
-        W_block = tl.load(W_ptr + row_w[:, None] * KK + col_w[None, :])
-
-        # Stage 2+3: C[M², M_PAD] = W[M², K²] @ T1[K², M_PAD]
-        C_block = tl.dot(W_block, T1)
-
-        # Store C[n] — only first M columns are valid
-        row_c = tl.arange(0, MM)
-        col_c = tl.arange(0, M_PAD)
-        c_mask = col_c[None, :] < M
-        tl.store(C_ptr + n * MMM + row_c[:, None] * M + col_c[None, :],
-                 C_block, mask=c_mask)
+        # ── Stage 2+3 fused: C[ab, c] = sum_ij W[ab, ij] * T1[ij, c] ─
+        # W = kron(Ar, As) precomputed on host: W[a*M+b, i*K+j] = Ar[a,i]*As[b,j]
+        # MMM = 512 = BLOCK  →  all lanes active, no wasted work
+        S23_PASSES: tl.constexpr = (MMM + BLOCK - 1) // BLOCK
+        for t in tl.static_range(S23_PASSES):
+            idx = offs + t * BLOCK
+            mask3 = idx < MMM
+            c3  = idx % M
+            ab  = idx // M
+            acc3 = tl.zeros([BLOCK], dtype=tl.float64)
+            for ij in tl.static_range(KK):
+                w_val  = tl.load(W_ptr + ab * KK + ij, mask=mask3)
+                t1_val = tl.load(tmpK_ptr + ij * M + c3, mask=mask3)
+                acc3 += w_val * t1_val
+            tl.store(C_ptr + n * MMM + idx, acc3, mask=mask3)
 
 
-def triton_fused_dot_tensor_product(Ar, As, At, B, M, K, N, num_warps=4):
-    """Fused Triton kernel using tl.dot (tensor cores) with Kronecker trick."""
-    W = torch.kron(Ar.view(M, K), As.view(M, K))  # [M², K²]
+def triton_fused_kron_tensor_product(Ar, As, At, B, M, K, N, num_warps=8):
+    """Fused Triton kernel using Kronecker trick: W=kron(Ar,As) merges stages 2+3."""
+    KKM = K * K * M
+    MMM = M * M * M
+    BLOCK = next_power_of_2(max(KKM, MMM))
+
+    W = torch.kron(Ar.view(M, K), As.view(M, K)).contiguous()  # [M², K²]
+    scratch = torch.empty(N * KKM, dtype=torch.float64, device='cuda')
     C = torch.empty((N, M, M, M), dtype=torch.float64, device='cuda')
-    K_PAD = max(16, next_power_of_2(K))
-    M_PAD = max(16, next_power_of_2(M))
-    _fused_dot_kernel[(N,)](W, At, B, C, N, M, K, K_PAD, M_PAD,
-                            num_warps=num_warps)
+
+    _fused_kron_kernel[(N,)](W, At, B, C, scratch, N, M, K, BLOCK,
+                             num_warps=num_warps)
     return C
 
 
@@ -689,20 +695,19 @@ def main():
     except Exception as e:
         print(f"  Triton fused kernel failed: {e}")
 
-    # ── Triton fused tl.dot kernel (tensor cores) ─────────────────────
-    if M == 8 and K == 4:
-        print("\n--- Triton fused tl.dot (tensor cores, Kronecker) ---")
-        try:
-            C_dot = triton_fused_dot_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
-            torch.cuda.synchronize()
-            validate("Triton tl.dot", C_cpu, C_dot, tol)
-            # Try different num_warps
-            for nw in [4, 8, 16]:
-                dt = bench(triton_fused_dot_tensor_product, ntrys,
-                           Ar_t, As_t, At_t, B_t, M, K, N, nw)
-                print(f"  num_warps={nw:2d}: time = {dt:.4e} s   TFLOPS = {FLOP / dt / 1e12:.3f}")
-        except Exception as e:
-            print(f"  Triton tl.dot kernel failed: {e}")
+    # ── Triton fused Kronecker kernel ──────────────────────────────────
+    print("\n--- Triton fused Kronecker (stages 2+3 merged) ---")
+    try:
+        C_kron = triton_fused_kron_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
+        torch.cuda.synchronize()
+        validate("Triton Kronecker", C_cpu, C_kron, tol)
+        # Sweep num_warps
+        for nw in [4, 8, 16]:
+            dt = bench(triton_fused_kron_tensor_product, ntrys,
+                       Ar_t, As_t, At_t, B_t, M, K, N, nw)
+            print(f"  num_warps={nw:2d}: time = {dt:.4e} s   TFLOPS = {FLOP / dt / 1e12:.3f}")
+    except Exception as e:
+        print(f"  Triton Kronecker kernel failed: {e}")
 
     # ── NVIDIA Warp 3-stage kernel ───────────────────────────────────
     if not HAS_WARP:
