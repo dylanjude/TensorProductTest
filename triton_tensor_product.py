@@ -269,6 +269,7 @@ if HAS_TRITON:
                              mask=mask1)
             acc1 += at_val * b_val
         tl.store(tmpK_ptr + offs, acc1, mask=mask1)
+        tl.debug_barrier()
 
         # ── Stage 2: tmpJ[i,b,c] = sum_j As[b,j] * tmpK[i,j,c] ─────
         S2_PASSES: tl.constexpr = (K * M * M + BLOCK - 1) // BLOCK
@@ -286,6 +287,7 @@ if HAS_TRITON:
                                    mask=mask2)
                 acc2 += as_val * tmpk_val
             tl.store(tmpJ_ptr + idx2, acc2, mask=mask2)
+        tl.debug_barrier()
 
         # ── Stage 3: C[n,a,b,c] = sum_i Ar[a,i] * tmpJ[i,b,c] ──────
         S3_PASSES: tl.constexpr = (M * M * M + BLOCK - 1) // BLOCK
