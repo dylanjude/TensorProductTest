@@ -307,17 +307,22 @@ if HAS_TRITON:
             tl.store(C_ptr + n * MMM + idx3, acc3, mask=mask3)
 
 
-def triton_fused_tensor_product(Ar, As, At, B, M, K, N):
+def triton_fused_tensor_product(Ar, As, At, B, M, K, N,
+                                num_warps=None, BLOCK=None):
     """Run the fused Triton kernel.  All tensors must be on CUDA."""
     KKM = K * K * M
     KMM = K * M * M
     MMM = M * M * M
-    BLOCK = next_power_of_2(max(KKM, KMM, MMM))
+    if BLOCK is None:
+        BLOCK = next_power_of_2(max(KKM, KMM, MMM))
+    if num_warps is None:
+        num_warps = max(1, BLOCK // 32)
 
     scratch = torch.empty(N * (KKM + KMM), dtype=torch.float64, device='cuda')
     C = torch.empty((N, M, M, M), dtype=torch.float64, device='cuda')
 
-    _fused_tp_kernel[(N,)](Ar, As, At, B, C, scratch, N, M, K, BLOCK)
+    _fused_tp_kernel[(N,)](Ar, As, At, B, C, scratch, N, M, K, BLOCK,
+                           num_warps=num_warps)
     return C
 
 
@@ -695,19 +700,28 @@ def main():
     except Exception as e:
         print(f"  Triton fused kernel failed: {e}")
 
-    # ── Triton fused Kronecker kernel ──────────────────────────────────
-    print("\n--- Triton fused Kronecker (stages 2+3 merged) ---")
+    # ── Triton fused BLOCK × num_warps sweep ──────────────────────────
+    print("\n--- Triton fused: BLOCK x num_warps sweep ---")
     try:
-        C_kron = triton_fused_kron_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
-        torch.cuda.synchronize()
-        validate("Triton Kronecker", C_cpu, C_kron, tol)
-        # Sweep num_warps
-        for nw in [4, 8, 16]:
-            dt = bench(triton_fused_kron_tensor_product, ntrys,
-                       Ar_t, As_t, At_t, B_t, M, K, N, nw)
-            print(f"  num_warps={nw:2d}: time = {dt:.4e} s   TFLOPS = {FLOP / dt / 1e12:.3f}")
+        for BLK in [128, 256, 512]:
+            for nw in [4, 8, 16]:
+                if nw > BLK // 32:
+                    continue
+                try:
+                    C_sw = triton_fused_tensor_product(
+                        Ar_t, As_t, At_t, B_t, M, K, N,
+                        num_warps=nw, BLOCK=BLK)
+                    torch.cuda.synchronize()
+                    diff = (C_sw.cpu().numpy() - C_cpu).max()
+                    dt = bench(triton_fused_tensor_product, ntrys,
+                               Ar_t, As_t, At_t, B_t, M, K, N, nw, BLK)
+                    ok = "OK" if abs(diff) < tol else f"FAIL {diff:.3e}"
+                    print(f"  BLOCK={BLK:3d} nw={nw:2d}: "
+                          f"time={dt:.4e} s  TFLOPS={FLOP/dt/1e12:.3f}  {ok}")
+                except Exception as e:
+                    print(f"  BLOCK={BLK:3d} nw={nw:2d}: failed — {e}")
     except Exception as e:
-        print(f"  Triton Kronecker kernel failed: {e}")
+        print(f"  Sweep failed: {e}")
 
     # ── NVIDIA Warp 3-stage kernel ───────────────────────────────────
     if not HAS_WARP:
