@@ -229,6 +229,97 @@ class TritonGraphed:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Triton fused kernel — single launch, L1-cached intermediates
+# ─────────────────────────────────────────────────────────────────────
+# One program per batch element.  Three stages in a single kernel;
+# intermediates (tmpK, tmpJ) go through a per-element scratch buffer
+# that stays warm in L1 cache (~3 KB per element).  Triton's compiler
+# inserts barriers between dependent stores and loads automatically.
+
+if HAS_TRITON:
+
+    @triton.jit
+    def _fused_tp_kernel(
+        Ar_ptr, As_ptr, At_ptr, B_ptr, C_ptr, scratch_ptr,
+        N: tl.constexpr, M: tl.constexpr, K: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        n = tl.program_id(0)
+        offs = tl.arange(0, BLOCK)
+
+        KKM = K * K * M
+        KMM = K * M * M
+        MMM = M * M * M
+        K3  = K * K * K
+
+        # Per-element scratch: tmpK[0..KKM-1] then tmpJ[KKM..KKM+KMM-1]
+        tmpK_ptr = scratch_ptr + n * (KKM + KMM)
+        tmpJ_ptr = tmpK_ptr + KKM
+
+        # ── Stage 1: tmpK[i,j,m] = sum_k At[m,k] * B[i,j,k] ────────
+        mask1 = offs < KKM
+        m1 = offs % M
+        tmp1 = offs // M
+        j1 = tmp1 % K
+        i1 = tmp1 // K
+        acc1 = tl.zeros([BLOCK], dtype=tl.float64)
+        for kk in tl.static_range(K):
+            at_val = tl.load(At_ptr + m1 * K + kk, mask=mask1)
+            b_val  = tl.load(B_ptr + n * K3 + i1 * K * K + j1 * K + kk,
+                             mask=mask1)
+            acc1 += at_val * b_val
+        tl.store(tmpK_ptr + offs, acc1, mask=mask1)
+
+        # ── Stage 2: tmpJ[i,b,c] = sum_j As[b,j] * tmpK[i,j,c] ─────
+        S2_PASSES: tl.constexpr = (K * M * M + BLOCK - 1) // BLOCK
+        for t in tl.static_range(S2_PASSES):
+            idx2 = offs + t * BLOCK
+            mask2 = idx2 < KMM
+            c2 = idx2 % M
+            tmp2 = idx2 // M
+            b2 = tmp2 % M
+            i2 = tmp2 // M
+            acc2 = tl.zeros([BLOCK], dtype=tl.float64)
+            for jj in tl.static_range(K):
+                as_val   = tl.load(As_ptr  + b2 * K + jj, mask=mask2)
+                tmpk_val = tl.load(tmpK_ptr + i2 * K * M + jj * M + c2,
+                                   mask=mask2)
+                acc2 += as_val * tmpk_val
+            tl.store(tmpJ_ptr + idx2, acc2, mask=mask2)
+
+        # ── Stage 3: C[n,a,b,c] = sum_i Ar[a,i] * tmpJ[i,b,c] ──────
+        S3_PASSES: tl.constexpr = (M * M * M + BLOCK - 1) // BLOCK
+        for t in tl.static_range(S3_PASSES):
+            idx3 = offs + t * BLOCK
+            mask3 = idx3 < MMM
+            c3 = idx3 % M
+            tmp3 = idx3 // M
+            b3 = tmp3 % M
+            a3 = tmp3 // M
+            acc3 = tl.zeros([BLOCK], dtype=tl.float64)
+            for ii in tl.static_range(K):
+                ar_val   = tl.load(Ar_ptr  + a3 * K + ii, mask=mask3)
+                tmpj_val = tl.load(tmpJ_ptr + ii * M * M + b3 * M + c3,
+                                   mask=mask3)
+                acc3 += ar_val * tmpj_val
+            tl.store(C_ptr + n * MMM + idx3, acc3, mask=mask3)
+
+
+def triton_fused_tensor_product(Ar, As, At, B, M, K, N):
+    """Run the fused Triton kernel.  All tensors must be on CUDA."""
+    KKM = K * K * M
+    KMM = K * M * M
+    MMM = M * M * M
+    BLOCK = next_power_of_2(max(KKM, KMM, MMM))
+
+    scratch = torch.empty(N * (KKM + KMM), dtype=torch.float64, device='cuda')
+    C = torch.empty((N, M, M, M), dtype=torch.float64, device='cuda')
+
+    _fused_tp_kernel[(N,)](Ar, As, At, B, C, scratch, N, M, K, BLOCK)
+    return C
+
+
+# ─────────────────────────────────────────────────────────────────────
 # NVIDIA Warp — 3-stage sum-factorised tensor product (simple)
 # ─────────────────────────────────────────────────────────────────────
 # One Warp thread per (n, output-element) pair in each stage.
@@ -511,6 +602,17 @@ def main():
         report_time(bench(graphed.replay, ntrys))
     except Exception as e:
         print(f"  CUDA graph capture failed: {e}")
+
+    # ── Triton fused kernel ───────────────────────────────────────────
+    print("\n--- Triton fused (single kernel) ---")
+    try:
+        C_fused = triton_fused_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
+        torch.cuda.synchronize()
+        validate("Triton fused", C_cpu, C_fused, tol)
+        report_time(bench(triton_fused_tensor_product, ntrys,
+                          Ar_t, As_t, At_t, B_t, M, K, N))
+    except Exception as e:
+        print(f"  Triton fused kernel failed: {e}")
 
     # ── NVIDIA Warp 3-stage kernel ───────────────────────────────────
     if not HAS_WARP:
