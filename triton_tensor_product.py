@@ -366,7 +366,8 @@ if HAS_TRITON:
             ar_val = tl.load(Ar_ptr + a * K + i, mask=mask)
             as_val = tl.load(As_ptr + b * K + j, mask=mask)
             at_val = tl.load(At_ptr + c * K + k, mask=mask)
-            b_val  = tl.load(B_ptr + n * K3 + ijk, mask=mask)
+            # B load is scalar (same value for all lanes) — no mask needed
+            b_val  = tl.load(B_ptr + n * K3 + ijk)
             acc += ar_val * as_val * at_val * b_val
 
         tl.store(C_ptr + n * MMM + offs, acc, mask=mask)
@@ -800,8 +801,8 @@ def main():
         C_bat = triton_batched_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
         torch.cuda.synchronize()
         validate("Triton batched", C_cpu, C_bat, tol)
-        for batch_sz in [2, 4, 8, 16]:
-            for nw in [4, 8]:
+        for batch_sz in [2, 4, 8, 16, 32, 64]:
+            for nw in [2, 4, 8]:
                 dt = bench(triton_batched_tensor_product, ntrys,
                            Ar_t, As_t, At_t, B_t, M, K, N, batch_sz, nw)
                 print(f"  BATCH={batch_sz:2d} nw={nw}: "
