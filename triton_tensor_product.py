@@ -327,81 +327,160 @@ def triton_fused_tensor_product(Ar, As, At, B, M, K, N,
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Triton fused tl.dot kernel (tensor cores, no scratch buffer)
+# Triton no-scratch kernel: each lane computes C[a,b,c] directly
 # ─────────────────────────────────────────────────────────────────────
-# Fuses all 3 stages into just 2 tl.dot calls by using the Kronecker
-# product trick:  W = kron(Ar, As)  so that stages 2+3 become a single
-# matrix multiply.  T1 stays in registers between the two dots — no
-# scratch buffer, no global-memory intermediates.
-#
-#   Stage 1:   T1[K²,M] = B[K²,K]  @ At^T[K,M]
-#   Stage 2+3: C[M²,M]  = W[M²,K²] @  T1[K²,M]
-#
-# Requires M, K to be powers of 2 (for tl.dot alignment).
+# No scratch buffer, no barriers.  Each lane evaluates the full triple
+# sum  C[a,b,c] = Σ_i Ar[a,i] · (Σ_j As[b,j] · (Σ_k At[c,k] · B[i,j,k]))
+# using nested accumulation (semi-factorised per lane).  B loads are
+# broadcast across all 512 lanes.  12× more FLOPs than sum-factorised,
+# but zero memory overhead beyond B reads and C writes.
 
 if HAS_TRITON:
 
     @triton.jit
-    def _fused_kron_kernel(
-        W_ptr, At_ptr, B_ptr, C_ptr, scratch_ptr,
+    def _fused_noscratch_kernel(
+        Ar_ptr, As_ptr, At_ptr, B_ptr, C_ptr,
         N: tl.constexpr, M: tl.constexpr, K: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
         n = tl.program_id(0)
         offs = tl.arange(0, BLOCK)
 
-        KK: tl.constexpr = K * K
-        KKM: tl.constexpr = KK * M
-        K3: tl.constexpr = KK * K
-        MM: tl.constexpr = M * M
-        MMM: tl.constexpr = MM * M
+        MMM: tl.constexpr = M * M * M
+        K3: tl.constexpr = K * K * K
 
-        tmpK_ptr = scratch_ptr + n * KKM
+        mask = offs < MMM
+        c = offs % M
+        tmp = offs // M
+        b = tmp % M
+        a = tmp // M
 
-        # ── Stage 1: tmpK[i*K+j, m] = sum_k At[m,k] * B[n,i,j,k] ───
-        mask1 = offs < KKM
-        m1 = offs % M
-        tmp1 = offs // M
-        j1 = tmp1 % K
-        i1 = tmp1 // K
-        acc1 = tl.zeros([BLOCK], dtype=tl.float64)
-        for kk in tl.static_range(K):
-            at_val = tl.load(At_ptr + m1 * K + kk, mask=mask1)
-            b_val  = tl.load(B_ptr + n * K3 + i1 * K * K + j1 * K + kk,
-                             mask=mask1)
-            acc1 += at_val * b_val
-        tl.store(tmpK_ptr + offs, acc1, mask=mask1)
-        tl.debug_barrier()
+        acc = tl.zeros([BLOCK], dtype=tl.float64)
+        for i in tl.static_range(K):
+            ar_val = tl.load(Ar_ptr + a * K + i, mask=mask)
+            s2_acc = tl.zeros([BLOCK], dtype=tl.float64)
+            for j in tl.static_range(K):
+                as_val = tl.load(As_ptr + b * K + j, mask=mask)
+                s1_acc = tl.zeros([BLOCK], dtype=tl.float64)
+                for k in tl.static_range(K):
+                    at_val = tl.load(At_ptr + c * K + k, mask=mask)
+                    b_val  = tl.load(B_ptr + n * K3
+                                     + i * K * K + j * K + k, mask=mask)
+                    s1_acc += at_val * b_val
+                s2_acc += as_val * s1_acc
+            acc += ar_val * s2_acc
 
-        # ── Stage 2+3 fused: C[ab, c] = sum_ij W[ab, ij] * T1[ij, c] ─
-        # W = kron(Ar, As) precomputed on host: W[a*M+b, i*K+j] = Ar[a,i]*As[b,j]
-        # MMM = 512 = BLOCK  →  all lanes active, no wasted work
-        S23_PASSES: tl.constexpr = (MMM + BLOCK - 1) // BLOCK
-        for t in tl.static_range(S23_PASSES):
-            idx = offs + t * BLOCK
-            mask3 = idx < MMM
-            c3  = idx % M
-            ab  = idx // M
-            acc3 = tl.zeros([BLOCK], dtype=tl.float64)
-            for ij in tl.static_range(KK):
-                w_val  = tl.load(W_ptr + ab * KK + ij, mask=mask3)
-                t1_val = tl.load(tmpK_ptr + ij * M + c3, mask=mask3)
-                acc3 += w_val * t1_val
-            tl.store(C_ptr + n * MMM + idx, acc3, mask=mask3)
+        tl.store(C_ptr + n * MMM + offs, acc, mask=mask)
 
 
-def triton_fused_kron_tensor_product(Ar, As, At, B, M, K, N, num_warps=8):
-    """Fused Triton kernel using Kronecker trick: W=kron(Ar,As) merges stages 2+3."""
-    KKM = K * K * M
+def triton_noscratch_tensor_product(Ar, As, At, B, M, K, N, num_warps=8):
+    """No-scratch Triton kernel: each lane computes C[a,b,c] directly."""
     MMM = M * M * M
-    BLOCK = next_power_of_2(max(KKM, MMM))
+    BLOCK = next_power_of_2(MMM)
+    C = torch.empty((N, M, M, M), dtype=torch.float64, device='cuda')
+    _fused_noscratch_kernel[(N,)](Ar, As, At, B, C, N, M, K, BLOCK,
+                                  num_warps=num_warps)
+    return C
 
-    W = torch.kron(Ar.view(M, K), As.view(M, K)).contiguous()  # [M², K²]
-    scratch = torch.empty(N * KKM, dtype=torch.float64, device='cuda')
+
+# ─────────────────────────────────────────────────────────────────────
+# Triton batched fused kernel: multiple elements per program
+# ─────────────────────────────────────────────────────────────────────
+# Same 3-stage sum-factorisation as _fused_tp_kernel but each program
+# processes BATCH elements sequentially, reusing the same scratch space.
+# Reduces program count → less scheduling overhead.
+
+if HAS_TRITON:
+
+    @triton.jit
+    def _fused_batched_kernel(
+        Ar_ptr, As_ptr, At_ptr, B_ptr, C_ptr, scratch_ptr,
+        N: tl.constexpr, M: tl.constexpr, K: tl.constexpr,
+        BLOCK: tl.constexpr, BATCH: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs = tl.arange(0, BLOCK)
+
+        KKM: tl.constexpr = K * K * M
+        KMM: tl.constexpr = K * M * M
+        MMM: tl.constexpr = M * M * M
+        K3: tl.constexpr = K * K * K
+
+        # Scratch is per-program (reused across batch elements)
+        tmpK_ptr = scratch_ptr + pid * (KKM + KMM)
+        tmpJ_ptr = tmpK_ptr + KKM
+
+        for elem in tl.static_range(BATCH):
+            n = pid * BATCH + elem
+
+            # ── Stage 1: tmpK[i,j,m] = sum_k At[m,k] * B[n,i,j,k] ──
+            mask1 = offs < KKM
+            m1 = offs % M
+            tmp1 = offs // M
+            j1 = tmp1 % K
+            i1 = tmp1 // K
+            acc1 = tl.zeros([BLOCK], dtype=tl.float64)
+            for kk in tl.static_range(K):
+                at_val = tl.load(At_ptr + m1 * K + kk, mask=mask1)
+                b_val  = tl.load(B_ptr + n * K3
+                                 + i1 * K * K + j1 * K + kk, mask=mask1)
+                acc1 += at_val * b_val
+            tl.store(tmpK_ptr + offs, acc1, mask=mask1)
+            tl.debug_barrier()
+
+            # ── Stage 2: tmpJ[i,b,c] = sum_j As[b,j] * tmpK[i,j,c] ─
+            S2P: tl.constexpr = (KMM + BLOCK - 1) // BLOCK
+            for t in tl.static_range(S2P):
+                idx2 = offs + t * BLOCK
+                mask2 = idx2 < KMM
+                c2 = idx2 % M
+                tmp2 = idx2 // M
+                b2 = tmp2 % M
+                i2 = tmp2 // M
+                acc2 = tl.zeros([BLOCK], dtype=tl.float64)
+                for jj in tl.static_range(K):
+                    as_val   = tl.load(As_ptr  + b2 * K + jj, mask=mask2)
+                    tmpk_val = tl.load(tmpK_ptr + i2 * K * M + jj * M + c2,
+                                       mask=mask2)
+                    acc2 += as_val * tmpk_val
+                tl.store(tmpJ_ptr + idx2, acc2, mask=mask2)
+            tl.debug_barrier()
+
+            # ── Stage 3: C[n,a,b,c] = sum_i Ar[a,i] * tmpJ[i,b,c] ──
+            S3P: tl.constexpr = (MMM + BLOCK - 1) // BLOCK
+            for t in tl.static_range(S3P):
+                idx3 = offs + t * BLOCK
+                mask3 = idx3 < MMM
+                c3 = idx3 % M
+                tmp3 = idx3 // M
+                b3 = tmp3 % M
+                a3 = tmp3 // M
+                acc3 = tl.zeros([BLOCK], dtype=tl.float64)
+                for ii in tl.static_range(K):
+                    ar_val   = tl.load(Ar_ptr  + a3 * K + ii, mask=mask3)
+                    tmpj_val = tl.load(tmpJ_ptr + ii * M * M + b3 * M + c3,
+                                       mask=mask3)
+                    acc3 += ar_val * tmpj_val
+                tl.store(C_ptr + n * MMM + idx3, acc3, mask=mask3)
+            tl.debug_barrier()
+
+
+def triton_batched_tensor_product(Ar, As, At, B, M, K, N,
+                                  BATCH=4, num_warps=4):
+    """Batched fused Triton kernel: BATCH elements per program."""
+    KKM = K * K * M
+    KMM = K * M * M
+    MMM = M * M * M
+    BLOCK = next_power_of_2(max(KKM, KMM, MMM))
+
+    n_progs = N // BATCH
+    scratch = torch.empty(n_progs * (KKM + KMM), dtype=torch.float64,
+                          device='cuda')
     C = torch.empty((N, M, M, M), dtype=torch.float64, device='cuda')
 
-    _fused_kron_kernel[(N,)](W, At, B, C, scratch, N, M, K, BLOCK,
-                             num_warps=num_warps)
+    _fused_batched_kernel[(n_progs,)](
+        Ar, As, At, B, C, scratch, N, M, K, BLOCK, BATCH,
+        num_warps=num_warps)
     return C
 
 
@@ -700,28 +779,33 @@ def main():
     except Exception as e:
         print(f"  Triton fused kernel failed: {e}")
 
-    # ── Triton fused BLOCK × num_warps sweep ──────────────────────────
-    print("\n--- Triton fused: BLOCK x num_warps sweep ---")
+    # ── Triton no-scratch kernel ─────────────────────────────────────
+    print("\n--- Triton no-scratch (direct per-lane) ---")
     try:
-        for BLK in [128, 256, 512]:
-            for nw in [4, 8, 16]:
-                if nw > BLK // 32:
-                    continue
-                try:
-                    C_sw = triton_fused_tensor_product(
-                        Ar_t, As_t, At_t, B_t, M, K, N,
-                        num_warps=nw, BLOCK=BLK)
-                    torch.cuda.synchronize()
-                    diff = (C_sw.cpu().numpy() - C_cpu).max()
-                    dt = bench(triton_fused_tensor_product, ntrys,
-                               Ar_t, As_t, At_t, B_t, M, K, N, nw, BLK)
-                    ok = "OK" if abs(diff) < tol else f"FAIL {diff:.3e}"
-                    print(f"  BLOCK={BLK:3d} nw={nw:2d}: "
-                          f"time={dt:.4e} s  TFLOPS={FLOP/dt/1e12:.3f}  {ok}")
-                except Exception as e:
-                    print(f"  BLOCK={BLK:3d} nw={nw:2d}: failed — {e}")
+        C_ns = triton_noscratch_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
+        torch.cuda.synchronize()
+        validate("Triton no-scratch", C_cpu, C_ns, tol)
+        for nw in [4, 8, 16]:
+            dt = bench(triton_noscratch_tensor_product, ntrys,
+                       Ar_t, As_t, At_t, B_t, M, K, N, nw)
+            print(f"  num_warps={nw:2d}: time = {dt:.4e} s   TFLOPS = {FLOP / dt / 1e12:.3f}")
     except Exception as e:
-        print(f"  Sweep failed: {e}")
+        print(f"  Triton no-scratch kernel failed: {e}")
+
+    # ── Triton batched fused kernel ───────────────────────────────────
+    print("\n--- Triton batched fused (multi-element per program) ---")
+    try:
+        C_bat = triton_batched_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
+        torch.cuda.synchronize()
+        validate("Triton batched", C_cpu, C_bat, tol)
+        for batch_sz in [2, 4, 8, 16]:
+            for nw in [4, 8]:
+                dt = bench(triton_batched_tensor_product, ntrys,
+                           Ar_t, As_t, At_t, B_t, M, K, N, batch_sz, nw)
+                print(f"  BATCH={batch_sz:2d} nw={nw}: "
+                      f"time={dt:.4e} s  TFLOPS={FLOP/dt/1e12:.3f}")
+    except Exception as e:
+        print(f"  Triton batched kernel failed: {e}")
 
     # ── NVIDIA Warp 3-stage kernel ───────────────────────────────────
     if not HAS_WARP:
