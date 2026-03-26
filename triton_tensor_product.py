@@ -348,6 +348,7 @@ if HAS_TRITON:
 
         MMM: tl.constexpr = M * M * M
         K3: tl.constexpr = K * K * K
+        KK: tl.constexpr = K * K
 
         mask = offs < MMM
         c = offs % M
@@ -355,20 +356,18 @@ if HAS_TRITON:
         b = tmp % M
         a = tmp // M
 
+        # Flatten the triple sum into a single loop over ijk ∈ [0, K³)
+        # C[a,b,c] = Σ_{ijk} Ar[a,i] * As[b,j] * At[c,k] * B[n,i,j,k]
         acc = tl.zeros([BLOCK], dtype=tl.float64)
-        for i in tl.static_range(K):
+        for ijk in tl.static_range(K3):
+            i = ijk // KK
+            j = (ijk // K) % K
+            k = ijk % K
             ar_val = tl.load(Ar_ptr + a * K + i, mask=mask)
-            s2_acc = tl.zeros([BLOCK], dtype=tl.float64)
-            for j in tl.static_range(K):
-                as_val = tl.load(As_ptr + b * K + j, mask=mask)
-                s1_acc = tl.zeros([BLOCK], dtype=tl.float64)
-                for k in tl.static_range(K):
-                    at_val = tl.load(At_ptr + c * K + k, mask=mask)
-                    b_val  = tl.load(B_ptr + n * K3
-                                     + i * K * K + j * K + k, mask=mask)
-                    s1_acc += at_val * b_val
-                s2_acc += as_val * s1_acc
-            acc += ar_val * s2_acc
+            as_val = tl.load(As_ptr + b * K + j, mask=mask)
+            at_val = tl.load(At_ptr + c * K + k, mask=mask)
+            b_val  = tl.load(B_ptr + n * K3 + ijk, mask=mask)
+            acc += ar_val * as_val * at_val * b_val
 
         tl.store(C_ptr + n * MMM + offs, acc, mask=mask)
 
@@ -410,15 +409,20 @@ if HAS_TRITON:
         tmpK_ptr = scratch_ptr + pid * (KKM + KMM)
         tmpJ_ptr = tmpK_ptr + KKM
 
+        S2P: tl.constexpr = (KMM + BLOCK - 1) // BLOCK
+        S3P: tl.constexpr = (MMM + BLOCK - 1) // BLOCK
+
+        # Pre-compute lane mappings (constant across batch iterations)
+        mask1 = offs < KKM
+        m1 = offs % M
+        tmp1 = offs // M
+        j1 = tmp1 % K
+        i1 = tmp1 // K
+
         for elem in tl.static_range(BATCH):
             n = pid * BATCH + elem
 
             # ── Stage 1: tmpK[i,j,m] = sum_k At[m,k] * B[n,i,j,k] ──
-            mask1 = offs < KKM
-            m1 = offs % M
-            tmp1 = offs // M
-            j1 = tmp1 % K
-            i1 = tmp1 // K
             acc1 = tl.zeros([BLOCK], dtype=tl.float64)
             for kk in tl.static_range(K):
                 at_val = tl.load(At_ptr + m1 * K + kk, mask=mask1)
@@ -429,7 +433,6 @@ if HAS_TRITON:
             tl.debug_barrier()
 
             # ── Stage 2: tmpJ[i,b,c] = sum_j As[b,j] * tmpK[i,j,c] ─
-            S2P: tl.constexpr = (KMM + BLOCK - 1) // BLOCK
             for t in tl.static_range(S2P):
                 idx2 = offs + t * BLOCK
                 mask2 = idx2 < KMM
@@ -447,7 +450,6 @@ if HAS_TRITON:
             tl.debug_barrier()
 
             # ── Stage 3: C[n,a,b,c] = sum_i Ar[a,i] * tmpJ[i,b,c] ──
-            S3P: tl.constexpr = (MMM + BLOCK - 1) // BLOCK
             for t in tl.static_range(S3P):
                 idx3 = offs + t * BLOCK
                 mask3 = idx3 < MMM
