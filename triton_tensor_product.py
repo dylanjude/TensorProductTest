@@ -48,14 +48,14 @@ def next_power_of_2(n):
     return n + 1
 
 
-def bench(fn, ntrys, *args):
+def bench(fn, ntrys, *args, **kwargs):
     """Warm up (3 iters), then time ntrys iterations.  Returns seconds/iter."""
     for _ in range(3):
-        fn(*args)
+        fn(*args, **kwargs)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(ntrys):
-        fn(*args)
+        fn(*args, **kwargs)
     torch.cuda.synchronize()
     return (time.perf_counter() - t0) / ntrys
 
@@ -318,6 +318,67 @@ def triton_fused_tensor_product(Ar, As, At, B, M, K, N):
     C = torch.empty((N, M, M, M), dtype=torch.float64, device='cuda')
 
     _fused_tp_kernel[(N,)](Ar, As, At, B, C, scratch, N, M, K, BLOCK)
+    return C
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Triton fused tl.dot kernel (tensor cores, no scratch buffer)
+# ─────────────────────────────────────────────────────────────────────
+# Fuses all 3 stages into just 2 tl.dot calls by using the Kronecker
+# product trick:  W = kron(Ar, As)  so that stages 2+3 become a single
+# matrix multiply.  T1 stays in registers between the two dots — no
+# scratch buffer, no global-memory intermediates.
+#
+#   Stage 1:   T1[K²,M] = B[K²,K]  @ At^T[K,M]
+#   Stage 2+3: C[M²,M]  = W[M²,K²] @  T1[K²,M]
+#
+# Requires M, K to be powers of 2 (for tl.dot alignment).
+
+if HAS_TRITON:
+
+    @triton.jit
+    def _fused_dot_kernel(
+        W_ptr, At_ptr, B_ptr, C_ptr,
+        N: tl.constexpr, M: tl.constexpr, K: tl.constexpr,
+    ):
+        n = tl.program_id(0)
+        KK: tl.constexpr = K * K
+        K3: tl.constexpr = KK * K
+        MM: tl.constexpr = M * M
+        MMM: tl.constexpr = MM * M
+
+        # Load B[n] as [K², K]
+        row_b = tl.arange(0, KK)
+        col_b = tl.arange(0, K)
+        B_block = tl.load(B_ptr + n * K3 + row_b[:, None] * K + col_b[None, :])
+
+        # Load At^T[K, M] from row-major At[M, K]
+        row_at = tl.arange(0, K)
+        col_at = tl.arange(0, M)
+        AtT_block = tl.load(At_ptr + col_at[None, :] * K + row_at[:, None])
+
+        # Stage 1: T1[K², M] = B[K², K] @ At^T[K, M]
+        T1 = tl.dot(B_block, AtT_block)
+
+        # Load W = kron(Ar, As) as [M², K²]
+        row_w = tl.arange(0, MM)
+        col_w = tl.arange(0, KK)
+        W_block = tl.load(W_ptr + row_w[:, None] * KK + col_w[None, :])
+
+        # Stage 2+3: C[M², M] = W[M², K²] @ T1[K², M]
+        C_block = tl.dot(W_block, T1)
+
+        # Store C[n] as [M², M]
+        row_c = tl.arange(0, MM)
+        col_c = tl.arange(0, M)
+        tl.store(C_ptr + n * MMM + row_c[:, None] * M + col_c[None, :], C_block)
+
+
+def triton_fused_dot_tensor_product(Ar, As, At, B, M, K, N, num_warps=4):
+    """Fused Triton kernel using tl.dot (tensor cores) with Kronecker trick."""
+    W = torch.kron(Ar.view(M, K), As.view(M, K))  # [M², K²]
+    C = torch.empty((N, M, M, M), dtype=torch.float64, device='cuda')
+    _fused_dot_kernel[(N,)](W, At, B, C, N, M, K, num_warps=num_warps)
     return C
 
 
@@ -615,6 +676,21 @@ def main():
                           Ar_t, As_t, At_t, B_t, M, K, N))
     except Exception as e:
         print(f"  Triton fused kernel failed: {e}")
+
+    # ── Triton fused tl.dot kernel (tensor cores) ─────────────────────
+    if M == 8 and K == 4:
+        print("\n--- Triton fused tl.dot (tensor cores, Kronecker) ---")
+        try:
+            C_dot = triton_fused_dot_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
+            torch.cuda.synchronize()
+            validate("Triton tl.dot", C_cpu, C_dot, tol)
+            # Try different num_warps
+            for nw in [4, 8, 16]:
+                dt = bench(triton_fused_dot_tensor_product, ntrys,
+                           Ar_t, As_t, At_t, B_t, M, K, N, nw)
+                print(f"  num_warps={nw:2d}: time = {dt:.4e} s   TFLOPS = {FLOP / dt / 1e12:.3f}")
+        except Exception as e:
+            print(f"  Triton tl.dot kernel failed: {e}")
 
     # ── NVIDIA Warp 3-stage kernel ───────────────────────────────────
     if not HAS_WARP:
