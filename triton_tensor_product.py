@@ -332,13 +332,11 @@ def warp_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N):
 # Expresses each contraction stage as a cooperative tile_matmul, which
 # has proper __syncthreads() internally.  One block per batch element.
 #
-# Stages 1+2 fused per i-slice (T1_i stays as tile, no global store):
-#   T1_i = B_i[K,K] @ At^T[K,M]        → tile (shared/register)
-#   T2_i = As[M,K]  @ T1_i[K,M]        → store to global
-# Stage 3:
-#   C[M,M²] = Ar[M,K] @ T2_view[K,M²] → 1 matmul
+# Stage 1: T1[K²,M] = B_reshaped[K²,K] @ At^T[K,M]      (1 matmul)
+# Stage 2: T2_i[M,M] = As[M,K] @ T1_i[K,M] for each i   (K matmuls)
+# Stage 3: C[M,M²]  = Ar[M,K] @ T2_view[K,M²]           (1 matmul)
 #
-# Only T2 goes through global memory (for the reshape).
+# Intermediates (T1, T2) go through global memory (L2-cached).
 # T2 is passed as two array views of the same memory:
 #   T2_w  [N, K*M, M] = [N, 32, 8]  for Stage 2 writes
 #   T2v_w [N, K, M²]  = [N, 4, 64]  for Stage 3 reads
@@ -357,25 +355,26 @@ if HAS_WARP:
         As:    wp.array2d(dtype=wp.float64),    # [M, K]    = [8, 4]
         Ar:    wp.array2d(dtype=wp.float64),    # [M, K]    = [8, 4]
         B:     wp.array3d(dtype=wp.float64),    # [N, K², K]  = [N, 16, 4]
+        T1:    wp.array3d(dtype=wp.float64),    # [N, K², M]  = [N, 16, 8]
         T2:    wp.array3d(dtype=wp.float64),    # [N, K*M, M] = [N, 32, 8]
         T2v:   wp.array3d(dtype=wp.float64),    # [N, K, M²]  = [N, 4, 64]  (same mem as T2)
         C:     wp.array3d(dtype=wp.float64),    # [N, M, M²]  = [N, 8, 64]
     ):
         n = wp.tid()
 
-        # Load operators once — stay as tiles (shared/register)
-        at_tile = wp.tile_load(At_T, shape=(_TK, _TM))     # [4, 8]
-        as_tile = wp.tile_load(As,   shape=(_TM, _TK))     # [8, 4]
+        # ── Stage 1: T1[K²,M] = B[K²,K] @ At^T[K,M] ──────────────
+        b_tile  = wp.tile_load(B[n],  shape=(_TK2, _TK))   # [16, 4]
+        at_tile = wp.tile_load(At_T,  shape=(_TK, _TM))    # [4, 8]
+        t1_tile = wp.tile_matmul(b_tile, at_tile)           # [16, 8]
+        wp.tile_store(T1[n], t1_tile)
 
-        # ── Stages 1+2 fused per i-slice ───────────────────────────
-        # For each i:  T1_i = B_i @ At^T   (tile, no global store)
-        #              T2_i = As  @ T1_i    (tile → global store)
+        # ── Stage 2: T2_i[M,M] = As[M,K] @ T1_i[K,M]  (4 slices) ─
+        as_tile = wp.tile_load(As, shape=(_TM, _TK))       # [8, 4]
         for i in range(4):
-            b_i  = wp.tile_load(B[n], shape=(_TK, _TK),
-                                offset=(i * _TK, 0))       # [4, 4]
-            t1_i = wp.tile_matmul(b_i, at_tile)             # [4, 8] — stays as tile!
-            t2_i = wp.tile_matmul(as_tile, t1_i)            # [8, 8]
-            wp.tile_store(T2[n], t2_i,
+            t1i = wp.tile_load(T1[n], shape=(_TK, _TM),
+                               offset=(i * _TK, 0))        # [4, 8]
+            t2i = wp.tile_matmul(as_tile, t1i)              # [8, 8]
+            wp.tile_store(T2[n], t2i,
                           offset=(i * _TM, 0))              # rows [i*8 .. i*8+8]
 
         # ── Stage 3: C[M,M²] = Ar[M,K] @ T2v[K,M²] ───────────────
@@ -398,19 +397,21 @@ def warp_fused_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N):
     Ar_w   = wp.from_torch(Ar_t.contiguous())                            # [8, 4]
     B_w    = wp.from_torch(B_t.contiguous().reshape(N, K*K, K))          # [N, 16, 4]
 
+    T1_t = torch.empty((N, K*K, M), dtype=torch.float64, device='cuda') # [N, 16, 8]
     T2_t = torch.empty((N, K*M, M), dtype=torch.float64, device='cuda') # [N, 32, 8]
     C_t  = torch.empty((N, M, M*M), dtype=torch.float64, device='cuda') # [N, 8, 64]
 
     # T2 viewed as [N, K, M²] for Stage 3 — same memory, different shape
     T2v_t = T2_t.reshape(N, K, M*M)
 
+    T1_w  = wp.from_torch(T1_t)
     T2_w  = wp.from_torch(T2_t)
     T2v_w = wp.from_torch(T2v_t)
     C_w   = wp.from_torch(C_t)
 
     wp.launch_tiled(_warp_tiled_84, dim=[N],
-                    inputs=[At_T_w, As_w, Ar_w, B_w, T2_w, T2v_w, C_w],
-                    block_dim=64)
+                    inputs=[At_T_w, As_w, Ar_w, B_w, T1_w, T2_w, T2v_w, C_w],
+                    block_dim=32)
 
     return C_t.reshape(N, M, M, M)
 
