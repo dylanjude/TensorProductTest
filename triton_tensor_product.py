@@ -340,6 +340,7 @@ if HAS_TRITON:
     def _fused_dot_kernel(
         W_ptr, At_ptr, B_ptr, C_ptr,
         N: tl.constexpr, M: tl.constexpr, K: tl.constexpr,
+        K_PAD: tl.constexpr, M_PAD: tl.constexpr,
     ):
         n = tl.program_id(0)
         KK: tl.constexpr = K * K
@@ -347,38 +348,49 @@ if HAS_TRITON:
         MM: tl.constexpr = M * M
         MMM: tl.constexpr = MM * M
 
-        # Load B[n] as [K², K]
+        # Load B[n] as [K², K_PAD] — zero-padded from [K², K]
         row_b = tl.arange(0, KK)
-        col_b = tl.arange(0, K)
-        B_block = tl.load(B_ptr + n * K3 + row_b[:, None] * K + col_b[None, :])
+        col_b = tl.arange(0, K_PAD)
+        b_mask = col_b[None, :] < K
+        B_block = tl.load(B_ptr + n * K3 + row_b[:, None] * K
+                          + tl.minimum(col_b[None, :], K - 1),
+                          mask=b_mask, other=0.0)
 
-        # Load At^T[K, M] from row-major At[M, K]
-        row_at = tl.arange(0, K)
-        col_at = tl.arange(0, M)
-        AtT_block = tl.load(At_ptr + col_at[None, :] * K + row_at[:, None])
+        # Load At^T as [K_PAD, M_PAD] — zero-padded from [K, M]
+        row_at = tl.arange(0, K_PAD)
+        col_at = tl.arange(0, M_PAD)
+        at_mask = (row_at[:, None] < K) & (col_at[None, :] < M)
+        AtT_block = tl.load(At_ptr + tl.minimum(col_at[None, :], M - 1) * K
+                            + tl.minimum(row_at[:, None], K - 1),
+                            mask=at_mask, other=0.0)
 
-        # Stage 1: T1[K², M] = B[K², K] @ At^T[K, M]
+        # Stage 1: T1[K², M_PAD] = B[K², K_PAD] @ At^T[K_PAD, M_PAD]
         T1 = tl.dot(B_block, AtT_block)
 
-        # Load W = kron(Ar, As) as [M², K²]
+        # Load W = kron(Ar, As) as [M², K²]  (KK=16 already meets min)
         row_w = tl.arange(0, MM)
         col_w = tl.arange(0, KK)
         W_block = tl.load(W_ptr + row_w[:, None] * KK + col_w[None, :])
 
-        # Stage 2+3: C[M², M] = W[M², K²] @ T1[K², M]
+        # Stage 2+3: C[M², M_PAD] = W[M², K²] @ T1[K², M_PAD]
         C_block = tl.dot(W_block, T1)
 
-        # Store C[n] as [M², M]
+        # Store C[n] — only first M columns are valid
         row_c = tl.arange(0, MM)
-        col_c = tl.arange(0, M)
-        tl.store(C_ptr + n * MMM + row_c[:, None] * M + col_c[None, :], C_block)
+        col_c = tl.arange(0, M_PAD)
+        c_mask = col_c[None, :] < M
+        tl.store(C_ptr + n * MMM + row_c[:, None] * M + col_c[None, :],
+                 C_block, mask=c_mask)
 
 
 def triton_fused_dot_tensor_product(Ar, As, At, B, M, K, N, num_warps=4):
     """Fused Triton kernel using tl.dot (tensor cores) with Kronecker trick."""
     W = torch.kron(Ar.view(M, K), As.view(M, K))  # [M², K²]
     C = torch.empty((N, M, M, M), dtype=torch.float64, device='cuda')
-    _fused_dot_kernel[(N,)](W, At, B, C, N, M, K, num_warps=num_warps)
+    K_PAD = max(16, next_power_of_2(K))
+    M_PAD = max(16, next_power_of_2(M))
+    _fused_dot_kernel[(N,)](W, At, B, C, N, M, K, K_PAD, M_PAD,
+                            num_warps=num_warps)
     return C
 
 
