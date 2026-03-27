@@ -465,16 +465,19 @@ if HAS_TRITON:
                                        mask=mask3)
                     acc3 += ar_val * tmpj_val
                 tl.store(C_ptr + n * MMM + idx3, acc3, mask=mask3)
-            tl.debug_barrier()
+            # No barrier needed after Stage 3: next iteration's Stage 1
+            # only writes tmpK (doesn't read tmpJ), and the Stage 2
+            # barrier already ensured all tmpK reads completed.
 
 
 def triton_batched_tensor_product(Ar, As, At, B, M, K, N,
-                                  BATCH=4, num_warps=4):
+                                  BATCH=4, num_warps=4, BLOCK=None):
     """Batched fused Triton kernel: BATCH elements per program."""
     KKM = K * K * M
     KMM = K * M * M
     MMM = M * M * M
-    BLOCK = next_power_of_2(max(KKM, KMM, MMM))
+    if BLOCK is None:
+        BLOCK = next_power_of_2(max(KKM, KMM, MMM))
 
     n_progs = N // BATCH
     scratch = torch.empty(n_progs * (KKM + KMM), dtype=torch.float64,
@@ -801,12 +804,14 @@ def main():
         C_bat = triton_batched_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
         torch.cuda.synchronize()
         validate("Triton batched", C_cpu, C_bat, tol)
-        for batch_sz in [2, 4, 8, 16, 32, 64]:
-            for nw in [2, 4, 8]:
-                dt = bench(triton_batched_tensor_product, ntrys,
-                           Ar_t, As_t, At_t, B_t, M, K, N, batch_sz, nw)
-                print(f"  BATCH={batch_sz:2d} nw={nw}: "
-                      f"time={dt:.4e} s  TFLOPS={FLOP/dt/1e12:.3f}")
+        for batch_sz in [4, 8, 16]:
+            for nw in [2, 4]:
+                for blk in [128, 256, 512]:
+                    dt = bench(triton_batched_tensor_product, ntrys,
+                               Ar_t, As_t, At_t, B_t, M, K, N,
+                               batch_sz, nw, blk)
+                    print(f"  BATCH={batch_sz:2d} nw={nw} BLK={blk:3d}: "
+                          f"time={dt:.4e} s  TFLOPS={FLOP/dt/1e12:.3f}")
     except Exception as e:
         print(f"  Triton batched kernel failed: {e}")
 
