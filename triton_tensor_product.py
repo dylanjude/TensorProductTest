@@ -27,12 +27,13 @@ try:
 except ImportError:
     HAS_TRITON = False
 
-try:
-    import warp as wp
-    wp.init()
-    HAS_WARP = True
-except (ImportError, Exception):
-    HAS_WARP = False
+# try:
+#     import warp as wp
+#     wp.init()
+#     HAS_WARP = True
+# except (ImportError, Exception):
+#     HAS_WARP = False
+HAS_WARP = False
 
 # ─────────────────────────────────────────────────────────────────────
 # Helpers
@@ -193,48 +194,11 @@ def triton_tensor_product(Ar, As, At, B, M, K, N):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# CUDA graph wrapper for Triton 3-stage
-# ─────────────────────────────────────────────────────────────────────
-
-class TritonGraphed:
-    """Captures the 3-stage Triton launch sequence as a CUDA graph."""
-
-    def __init__(self, Ar, As, At, B, M, K, N):
-        BLOCK1 = next_power_of_2(K * K * M)
-        BLOCK2 = next_power_of_2(K * M * M)
-        BLOCK3 = next_power_of_2(M * M * M)
-        grid = (N,)
-
-        # Pre-allocate all buffers (reused across replays)
-        self.tmp1 = torch.empty((N, K, K, M), dtype=torch.float64, device='cuda')
-        self.tmp2 = torch.empty((N, K, M, M), dtype=torch.float64, device='cuda')
-        self.C    = torch.empty((N, M, M, M), dtype=torch.float64, device='cuda')
-
-        # Warm up the kernels before capture
-        _stage1_kernel[grid](At, B, self.tmp1, N, M, K, BLOCK1)
-        _stage2_kernel[grid](As, self.tmp1, self.tmp2, N, M, K, BLOCK2)
-        _stage3_kernel[grid](Ar, self.tmp2, self.C, N, M, K, BLOCK3)
-        torch.cuda.synchronize()
-
-        # Capture
-        self._graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self._graph):
-            _stage1_kernel[grid](At, B, self.tmp1, N, M, K, BLOCK1)
-            _stage2_kernel[grid](As, self.tmp1, self.tmp2, N, M, K, BLOCK2)
-            _stage3_kernel[grid](Ar, self.tmp2, self.C, N, M, K, BLOCK3)
-
-    def replay(self):
-        self._graph.replay()
-        return self.C
-
-
-# ─────────────────────────────────────────────────────────────────────
 # Triton fused kernel — single launch, L1-cached intermediates
 # ─────────────────────────────────────────────────────────────────────
 # One program per batch element.  Three stages in a single kernel;
 # intermediates (tmpK, tmpJ) go through a per-element scratch buffer
-# that stays warm in L1 cache (~3 KB per element).  Triton's compiler
-# inserts barriers between dependent stores and loads automatically.
+# that stays warm in L1 cache (~3 KB per element).
 
 if HAS_TRITON:
 
@@ -308,78 +272,19 @@ if HAS_TRITON:
 
 
 def triton_fused_tensor_product(Ar, As, At, B, M, K, N,
-                                num_warps=None, BLOCK=None):
+                                num_warps=4, BLOCK=None):
     """Run the fused Triton kernel.  All tensors must be on CUDA."""
     KKM = K * K * M
     KMM = K * M * M
     MMM = M * M * M
     if BLOCK is None:
         BLOCK = next_power_of_2(max(KKM, KMM, MMM))
-    if num_warps is None:
-        num_warps = max(1, BLOCK // 32)
 
     scratch = torch.empty(N * (KKM + KMM), dtype=torch.float64, device='cuda')
     C = torch.empty((N, M, M, M), dtype=torch.float64, device='cuda')
 
     _fused_tp_kernel[(N,)](Ar, As, At, B, C, scratch, N, M, K, BLOCK,
                            num_warps=num_warps)
-    return C
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Triton no-scratch kernel: each lane computes C[a,b,c] directly
-# ─────────────────────────────────────────────────────────────────────
-# No scratch buffer, no barriers.  Each lane evaluates the full triple
-# sum  C[a,b,c] = Σ_i Ar[a,i] · (Σ_j As[b,j] · (Σ_k At[c,k] · B[i,j,k]))
-# using nested accumulation (semi-factorised per lane).  B loads are
-# broadcast across all 512 lanes.  12× more FLOPs than sum-factorised,
-# but zero memory overhead beyond B reads and C writes.
-
-if HAS_TRITON:
-
-    @triton.jit
-    def _fused_noscratch_kernel(
-        Ar_ptr, As_ptr, At_ptr, B_ptr, C_ptr,
-        N: tl.constexpr, M: tl.constexpr, K: tl.constexpr,
-        BLOCK: tl.constexpr,
-    ):
-        n = tl.program_id(0)
-        offs = tl.arange(0, BLOCK)
-
-        MMM: tl.constexpr = M * M * M
-        K3: tl.constexpr = K * K * K
-        KK: tl.constexpr = K * K
-
-        mask = offs < MMM
-        c = offs % M
-        tmp = offs // M
-        b = tmp % M
-        a = tmp // M
-
-        # Flatten the triple sum into a single loop over ijk ∈ [0, K³)
-        # C[a,b,c] = Σ_{ijk} Ar[a,i] * As[b,j] * At[c,k] * B[n,i,j,k]
-        acc = tl.zeros([BLOCK], dtype=tl.float64)
-        for ijk in tl.static_range(K3):
-            i = ijk // KK
-            j = (ijk // K) % K
-            k = ijk % K
-            ar_val = tl.load(Ar_ptr + a * K + i, mask=mask)
-            as_val = tl.load(As_ptr + b * K + j, mask=mask)
-            at_val = tl.load(At_ptr + c * K + k, mask=mask)
-            # B load is scalar (same value for all lanes) — no mask needed
-            b_val  = tl.load(B_ptr + n * K3 + ijk)
-            acc += ar_val * as_val * at_val * b_val
-
-        tl.store(C_ptr + n * MMM + offs, acc, mask=mask)
-
-
-def triton_noscratch_tensor_product(Ar, As, At, B, M, K, N, num_warps=8):
-    """No-scratch Triton kernel: each lane computes C[a,b,c] directly."""
-    MMM = M * M * M
-    BLOCK = next_power_of_2(MMM)
-    C = torch.empty((N, M, M, M), dtype=torch.float64, device='cuda')
-    _fused_noscratch_kernel[(N,)](Ar, As, At, B, C, N, M, K, BLOCK,
-                                  num_warps=num_warps)
     return C
 
 
@@ -471,7 +376,7 @@ if HAS_TRITON:
 
 
 def triton_batched_tensor_product(Ar, As, At, B, M, K, N,
-                                  BATCH=4, num_warps=4, BLOCK=None):
+                                  BATCH=8, num_warps=4, BLOCK=None):
     """Batched fused Triton kernel: BATCH elements per program."""
     KKM = K * K * M
     KMM = K * M * M
@@ -491,191 +396,20 @@ def triton_batched_tensor_product(Ar, As, At, B, M, K, N,
 
 
 # ─────────────────────────────────────────────────────────────────────
-# NVIDIA Warp — 3-stage sum-factorised tensor product (simple)
+# NVIDIA Warp kernels (commented out for multi-size benchmarking)
 # ─────────────────────────────────────────────────────────────────────
-# One Warp thread per (n, output-element) pair in each stage.
-# No shared memory — every thread reads operators from global memory
-# (L1/L2 cached).  Three separate kernel launches.
 
-if HAS_WARP:
-
-    @wp.kernel
-    def _warp_stage1(
-        At: wp.array2d(dtype=wp.float64),   # (M, K)
-        B: wp.array2d(dtype=wp.float64),     # (N, K^3)
-        out: wp.array2d(dtype=wp.float64),   # (N, K*K*M)
-        M_val: int, K_val: int,
-    ):
-        """out[n, i*K*M + j*M + m] = sum_k At[m,k] * B[n, i*K*K + j*K + k]"""
-        tid = wp.tid()
-        KKM = K_val * K_val * M_val
-        n = tid // KKM
-        rem = tid - n * KKM
-        m = rem % M_val
-        tmp = rem // M_val
-        j = tmp % K_val
-        i = tmp // K_val
-        acc = wp.float64(0.0)
-        for kk in range(K_val):
-            acc += At[m, kk] * B[n, i * K_val * K_val + j * K_val + kk]
-        out[n, rem] = acc
-
-    @wp.kernel
-    def _warp_stage2(
-        As: wp.array2d(dtype=wp.float64),   # (M, K)
-        inp: wp.array2d(dtype=wp.float64),  # (N, K*K*M)
-        out: wp.array2d(dtype=wp.float64),  # (N, K*M*M)
-        M_val: int, K_val: int,
-    ):
-        """out[n, i*M*M + b*M + c] = sum_j As[b,j] * inp[n, i*K*M + j*M + c]"""
-        tid = wp.tid()
-        KMM = K_val * M_val * M_val
-        n = tid // KMM
-        rem = tid - n * KMM
-        c = rem % M_val
-        tmp = rem // M_val
-        b = tmp % M_val
-        i = tmp // M_val
-        acc = wp.float64(0.0)
-        for jj in range(K_val):
-            acc += As[b, jj] * inp[n, i * K_val * M_val + jj * M_val + c]
-        out[n, rem] = acc
-
-    @wp.kernel
-    def _warp_stage3(
-        Ar: wp.array2d(dtype=wp.float64),   # (M, K)
-        inp: wp.array2d(dtype=wp.float64),  # (N, K*M*M)
-        out: wp.array2d(dtype=wp.float64),  # (N, M*M*M)
-        M_val: int, K_val: int,
-    ):
-        """out[n, a*M*M + b*M + c] = sum_i Ar[a,i] * inp[n, i*M*M + b*M + c]"""
-        tid = wp.tid()
-        MMM = M_val * M_val * M_val
-        n = tid // MMM
-        rem = tid - n * MMM
-        c = rem % M_val
-        tmp = rem // M_val
-        b = tmp % M_val
-        a = tmp // M_val
-        acc = wp.float64(0.0)
-        for ii in range(K_val):
-            acc += Ar[a, ii] * inp[n, ii * M_val * M_val + b * M_val + c]
-        out[n, rem] = acc
-
-
-def warp_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N):
-    """Run the 3-stage Warp kernel.  All tensors must be on CUDA (torch)."""
-    At_w = wp.from_torch(At_t.contiguous().reshape(M, K))
-    As_w = wp.from_torch(As_t.contiguous().reshape(M, K))
-    Ar_w = wp.from_torch(Ar_t.contiguous().reshape(M, K))
-    B_w  = wp.from_torch(B_t.contiguous().reshape(N, K * K * K))
-
-    tmp1_t = torch.empty((N, K * K * M), dtype=torch.float64, device='cuda')
-    tmp2_t = torch.empty((N, K * M * M), dtype=torch.float64, device='cuda')
-    C_t    = torch.empty((N, M * M * M), dtype=torch.float64, device='cuda')
-
-    tmp1_w = wp.from_torch(tmp1_t)
-    tmp2_w = wp.from_torch(tmp2_t)
-    C_w    = wp.from_torch(C_t)
-
-    wp.launch(_warp_stage1, dim=N * K * K * M,
-              inputs=[At_w, B_w, tmp1_w, M, K])
-    wp.launch(_warp_stage2, dim=N * K * M * M,
-              inputs=[As_w, tmp1_w, tmp2_w, M, K])
-    wp.launch(_warp_stage3, dim=N * M * M * M,
-              inputs=[Ar_w, tmp2_w, C_w, M, K])
-
-    return C_t.reshape(N, M, M, M)
-
-
-# ─────────────────────────────────────────────────────────────────────
-# NVIDIA Warp — tile_matmul fused kernel (M=8, K=4)
-# ─────────────────────────────────────────────────────────────────────
-# Expresses each contraction stage as a cooperative tile_matmul, which
-# has proper __syncthreads() internally.  One block per batch element.
+# if HAS_WARP:
 #
-# Stage 1: T1[K²,M] = B_reshaped[K²,K] @ At^T[K,M]      (1 matmul)
-# Stage 2: T2_i[M,M] = As[M,K] @ T1_i[K,M] for each i   (K matmuls)
-# Stage 3: C[M,M²]  = Ar[M,K] @ T2_view[K,M²]           (1 matmul)
+#     @wp.kernel
+#     def _warp_stage1( ... ): ...
+#     @wp.kernel
+#     def _warp_stage2( ... ): ...
+#     @wp.kernel
+#     def _warp_stage3( ... ): ...
 #
-# Intermediates (T1, T2) go through global memory (L2-cached).
-# T2 is passed as two array views of the same memory:
-#   T2_w  [N, K*M, M] = [N, 32, 8]  for Stage 2 writes
-#   T2v_w [N, K, M²]  = [N, 4, 64]  for Stage 3 reads
-
-if HAS_WARP:
-
-    # Compile-time tile shape constants for M=8, K=4
-    _TM = wp.constant(8)     # M
-    _TK = wp.constant(4)     # K
-    _TK2 = wp.constant(16)   # K² = 16
-    _TM2 = wp.constant(64)   # M² = 64
-
-    @wp.kernel
-    def _warp_tiled_84(
-        At_T:  wp.array2d(dtype=wp.float64),   # [K, M]    = [4, 8]  (transposed)
-        As:    wp.array2d(dtype=wp.float64),    # [M, K]    = [8, 4]
-        Ar:    wp.array2d(dtype=wp.float64),    # [M, K]    = [8, 4]
-        B:     wp.array3d(dtype=wp.float64),    # [N, K², K]  = [N, 16, 4]
-        T1:    wp.array3d(dtype=wp.float64),    # [N, K², M]  = [N, 16, 8]
-        T2:    wp.array3d(dtype=wp.float64),    # [N, K*M, M] = [N, 32, 8]
-        T2v:   wp.array3d(dtype=wp.float64),    # [N, K, M²]  = [N, 4, 64]  (same mem as T2)
-        C:     wp.array3d(dtype=wp.float64),    # [N, M, M²]  = [N, 8, 64]
-    ):
-        n = wp.tid()
-
-        # ── Stage 1: T1[K²,M] = B[K²,K] @ At^T[K,M] ──────────────
-        b_tile  = wp.tile_load(B[n],  shape=(_TK2, _TK))   # [16, 4]
-        at_tile = wp.tile_load(At_T,  shape=(_TK, _TM))    # [4, 8]
-        t1_tile = wp.tile_matmul(b_tile, at_tile)           # [16, 8]
-        wp.tile_store(T1[n], t1_tile)
-
-        # ── Stage 2: T2_i[M,M] = As[M,K] @ T1_i[K,M]  (4 slices) ─
-        as_tile = wp.tile_load(As, shape=(_TM, _TK))       # [8, 4]
-        for i in range(4):
-            t1i = wp.tile_load(T1[n], shape=(_TK, _TM),
-                               offset=(i * _TK, 0))        # [4, 8]
-            t2i = wp.tile_matmul(as_tile, t1i)              # [8, 8]
-            wp.tile_store(T2[n], t2i,
-                          offset=(i * _TM, 0))              # rows [i*8 .. i*8+8]
-
-        # ── Stage 3: C[M,M²] = Ar[M,K] @ T2v[K,M²] ───────────────
-        ar_tile  = wp.tile_load(Ar,     shape=(_TM, _TK))  # [8, 4]
-        t2v_tile = wp.tile_load(T2v[n], shape=(_TK, _TM2)) # [4, 64]
-        c_tile   = wp.tile_matmul(ar_tile, t2v_tile)        # [8, 64]
-        wp.tile_store(C[n], c_tile)
-
-
-def warp_fused_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N):
-    """Run the tile_matmul fused Warp kernel.  Currently only M=8, K=4."""
-    if M != 8 or K != 4:
-        raise ValueError(f"Fused Warp kernel only supports M=8, K=4 (got M={M}, K={K})")
-
-    # Pre-transpose At for Stage 1: need [K, M] = [4, 8]
-    At_T_t = At_t.t().contiguous()
-
-    At_T_w = wp.from_torch(At_T_t)                                      # [4, 8]
-    As_w   = wp.from_torch(As_t.contiguous())                            # [8, 4]
-    Ar_w   = wp.from_torch(Ar_t.contiguous())                            # [8, 4]
-    B_w    = wp.from_torch(B_t.contiguous().reshape(N, K*K, K))          # [N, 16, 4]
-
-    T1_t = torch.empty((N, K*K, M), dtype=torch.float64, device='cuda') # [N, 16, 8]
-    T2_t = torch.empty((N, K*M, M), dtype=torch.float64, device='cuda') # [N, 32, 8]
-    C_t  = torch.empty((N, M, M*M), dtype=torch.float64, device='cuda') # [N, 8, 64]
-
-    # T2 viewed as [N, K, M²] for Stage 3 — same memory, different shape
-    T2v_t = T2_t.reshape(N, K, M*M)
-
-    T1_w  = wp.from_torch(T1_t)
-    T2_w  = wp.from_torch(T2_t)
-    T2v_w = wp.from_torch(T2v_t)
-    C_w   = wp.from_torch(C_t)
-
-    wp.launch_tiled(_warp_tiled_84, dim=[N],
-                    inputs=[At_T_w, As_w, Ar_w, B_w, T1_w, T2_w, T2v_w, C_w],
-                    block_dim=32)
-
-    return C_t.reshape(N, M, M, M)
+# def warp_tensor_product( ... ): ...
+# def warp_fused_tensor_product( ... ): ...
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -732,21 +466,6 @@ def main():
     validate("torch.einsum", C_cpu, C_torch, tol)
     report_time(bench(torch_tensor_product, ntrys, Ar_t, As_t, At_t, B_t))
 
-    # ── torch.compile'd einsum ───────────────────────────────────────
-    print("\n--- torch.compile(einsum) GPU ---")
-    try:
-        # Compilation happens on first call; run a few warm-ups
-        for _ in range(3):
-            torch_tensor_product_compiled(Ar_t, As_t, At_t, B_t)
-        torch.cuda.synchronize()
-        C_compiled = torch_tensor_product_compiled(Ar_t, As_t, At_t, B_t)
-        torch.cuda.synchronize()
-        validate("torch.compile", C_cpu, C_compiled, tol)
-        report_time(bench(torch_tensor_product_compiled, ntrys,
-                          Ar_t, As_t, At_t, B_t))
-    except Exception as e:
-        print(f"  torch.compile failed: {e}")
-
     # ── Triton kernels ───────────────────────────────────────────────
     if not HAS_TRITON:
         print("\nTriton not installed — skipping Triton benchmarks.")
@@ -760,22 +479,11 @@ def main():
         report_time(bench(triton_tensor_product, ntrys,
                           Ar_t, As_t, At_t, B_t, M, K, N))
     except Exception as e:
-        print(f"  Triton compilation failed (likely SM < 7.0): {e}")
+        print(f"  Triton compilation failed: {e}")
         return
 
-    # ── CUDA graph of Triton 3-stage ─────────────────────────────────
-    print("\n--- Triton 3-stage + CUDA graph ---")
-    try:
-        graphed = TritonGraphed(Ar_t, As_t, At_t, B_t, M, K, N)
-        C_graphed = graphed.replay()
-        torch.cuda.synchronize()
-        validate("Triton+CUDAgraph", C_cpu, C_graphed, tol)
-        report_time(bench(graphed.replay, ntrys))
-    except Exception as e:
-        print(f"  CUDA graph capture failed: {e}")
-
     # ── Triton fused kernel ───────────────────────────────────────────
-    print("\n--- Triton fused (single kernel) ---")
+    print("\n--- Triton fused (single kernel, nw=4) ---")
     try:
         C_fused = triton_fused_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
         torch.cuda.synchronize()
@@ -785,61 +493,19 @@ def main():
     except Exception as e:
         print(f"  Triton fused kernel failed: {e}")
 
-    # ── Triton no-scratch kernel ─────────────────────────────────────
-    print("\n--- Triton no-scratch (direct per-lane) ---")
-    try:
-        C_ns = triton_noscratch_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
-        torch.cuda.synchronize()
-        validate("Triton no-scratch", C_cpu, C_ns, tol)
-        for nw in [4, 8, 16]:
-            dt = bench(triton_noscratch_tensor_product, ntrys,
-                       Ar_t, As_t, At_t, B_t, M, K, N, nw)
-            print(f"  num_warps={nw:2d}: time = {dt:.4e} s   TFLOPS = {FLOP / dt / 1e12:.3f}")
-    except Exception as e:
-        print(f"  Triton no-scratch kernel failed: {e}")
-
     # ── Triton batched fused kernel ───────────────────────────────────
-    print("\n--- Triton batched fused (multi-element per program) ---")
+    print("\n--- Triton batched fused ---")
     try:
         C_bat = triton_batched_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
         torch.cuda.synchronize()
         validate("Triton batched", C_cpu, C_bat, tol)
-        for batch_sz in [4, 8, 16]:
-            for nw in [2, 4]:
-                for blk in [128, 256, 512]:
-                    dt = bench(triton_batched_tensor_product, ntrys,
-                               Ar_t, As_t, At_t, B_t, M, K, N,
-                               batch_sz, nw, blk)
-                    print(f"  BATCH={batch_sz:2d} nw={nw} BLK={blk:3d}: "
-                          f"time={dt:.4e} s  TFLOPS={FLOP/dt/1e12:.3f}")
+        for batch_sz in [4, 8]:
+            dt = bench(triton_batched_tensor_product, ntrys,
+                       Ar_t, As_t, At_t, B_t, M, K, N, batch_sz, 4)
+            print(f"  BATCH={batch_sz} nw=4: "
+                  f"time={dt:.4e} s  TFLOPS={FLOP/dt/1e12:.3f}")
     except Exception as e:
         print(f"  Triton batched kernel failed: {e}")
-
-    # ── NVIDIA Warp 3-stage kernel ───────────────────────────────────
-    if not HAS_WARP:
-        print("\nwarp-lang not installed — skipping Warp benchmarks.")
-    else:
-        print("\n--- NVIDIA Warp 3-stage ---")
-        try:
-            C_warp = warp_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
-            torch.cuda.synchronize()
-            validate("Warp 3-stage", C_cpu, C_warp, tol)
-            report_time(bench(warp_tensor_product, ntrys,
-                              Ar_t, As_t, At_t, B_t, M, K, N))
-        except Exception as e:
-            print(f"  Warp kernel failed: {e}")
-
-        # ── NVIDIA Warp tile_matmul fused kernel (M=8 K=4 only) ───────
-        if M == 8 and K == 4:
-            print("\n--- NVIDIA Warp tile_matmul fused ---")
-            try:
-                C_wfused = warp_fused_tensor_product(Ar_t, As_t, At_t, B_t, M, K, N)
-                torch.cuda.synchronize()
-                validate("Warp tile_matmul", C_cpu, C_wfused, tol)
-                report_time(bench(warp_fused_tensor_product, ntrys,
-                                  Ar_t, As_t, At_t, B_t, M, K, N))
-            except Exception as e:
-                print(f"  Warp tile_matmul kernel failed: {e}")
 
 
 if __name__ == '__main__':
